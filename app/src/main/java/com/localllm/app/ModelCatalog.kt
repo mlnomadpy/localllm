@@ -200,7 +200,7 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         // error and the server stays alive. See aicore/AICoreEngine.kt.
         id = com.localllm.app.aicore.AICoreEngine.MODEL_ID,
         name = "Gemini Nano · AICore",
-        description = "System-provided Gemini Nano via Google AICore. No download — Android manages the model. Requires Pixel 8+ with a compatible AICore build; on a fresh device the model may take a while to provision in the background.",
+        description = "System-provided Gemini Nano via Google AICore. No download — Android manages the model. Requires Pixel 8+ with a compatible AICore build. NOTE: AICore enforces foreground-only usage — the chat tab must be on-screen when an HTTP client calls `gemini-nano-aicore`, otherwise the SDK returns ErrorCode 30 (background usage blocked).",
         url = "",
         filename = "",
         isVirtual = true,

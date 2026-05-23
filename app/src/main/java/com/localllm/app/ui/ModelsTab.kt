@@ -333,6 +333,26 @@ private fun ModelCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            } else if (model.isVirtual) {
+                // Virtual entries (AICore etc.) have no file on disk and no
+                // download URL. Surface the "managed by the system" hint and
+                // hide the Download/Delete buttons that would otherwise fire
+                // a DownloadManager request against an empty URL and stall
+                // the active-downloads poll loop.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Outlined.Memory,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Provided by the system — no download needed",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
             } else {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
