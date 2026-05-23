@@ -1,9 +1,14 @@
 package com.localllm.app.aicore
 
+import com.google.mlkit.genai.common.DownloadStatus
 import com.google.mlkit.genai.prompt.GenerateContentRequest
 import com.google.mlkit.genai.prompt.Generation
 import com.google.mlkit.genai.prompt.GenerativeModel
+import com.google.mlkit.genai.prompt.ModelPreference
+import com.google.mlkit.genai.prompt.ModelReleaseStage
 import com.google.mlkit.genai.prompt.TextPart
+import com.google.mlkit.genai.prompt.generationConfig
+import com.google.mlkit.genai.prompt.modelConfig
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 
@@ -29,22 +34,68 @@ object AICoreEngine {
     /** OpenAI-style model id clients pass to `/v1/chat/completions`. */
     const val MODEL_ID = "gemini-nano-aicore"
 
-    /** Matches `GenerativeModel.checkStatus()` return constants. */
-    const val STATUS_AVAILABLE = 0
+    /**
+     * Matches `com.google.mlkit.genai.common.FeatureStatus` constants
+     * (declaration order: UNAVAILABLE=0, DOWNLOADABLE=1, DOWNLOADING=2,
+     * AVAILABLE=3). Mirroring them here keeps consumers off the
+     * `genai-common` direct dependency.
+     */
+    const val STATUS_UNAVAILABLE = 0
     const val STATUS_DOWNLOADABLE = 1
     const val STATUS_DOWNLOADING = 2
-    const val STATUS_UNAVAILABLE = 3
+    const val STATUS_AVAILABLE = 3
 
     @Volatile private var clientRef: GenerativeModel? = null
 
+    /**
+     * On bleeding-edge devices (Pixel 10) the STABLE rollout of Gemini Nano
+     * hasn't happened yet, so the default `Generation.getClient()` (which
+     * picks STABLE) returns `STATUS_UNAVAILABLE`. PREVIEW is the AICore
+     * Developer Preview track and is what's actually shipping there.
+     * Choosing FAST over FULL also keeps latency closer to interactive.
+     * If a downstream caller needs STABLE, expose a config override later.
+     */
     private fun client(): GenerativeModel {
         clientRef?.let { return it }
         synchronized(this) {
             clientRef?.let { return it }
-            val c = Generation.getClient()
+            val cfg = generationConfig {
+                modelConfig = modelConfig {
+                    releaseStage = ModelReleaseStage.PREVIEW
+                    preference = ModelPreference.FAST
+                }
+            }
+            val c = Generation.getClient(cfg)
             clientRef = c
             return c
         }
+    }
+
+    /**
+     * Make sure the model is actually present before [stream] / [complete].
+     *
+     * - AVAILABLE → no-op, return [STATUS_AVAILABLE].
+     * - DOWNLOADABLE → call `download()` and block until the SDK reports
+     *   `DownloadCompleted` (or throws on `DownloadFailed`), then re-check.
+     * - DOWNLOADING → wait for the existing download by collecting `download()`
+     *   too — the SDK serialises and the same Flow surfaces progress for an
+     *   already-running pull.
+     * - UNAVAILABLE → return unchanged; caller surfaces the structured error.
+     *
+     * Returns the post-action status code so the caller can decide what to
+     * do (proceed, retry later, fail with a useful message).
+     */
+    suspend fun ensureReady(): Int {
+        val initial = client().checkStatus()
+        if (initial != STATUS_DOWNLOADABLE && initial != STATUS_DOWNLOADING) return initial
+        client().download().collect { ds ->
+            when (ds) {
+                is DownloadStatus.DownloadFailed -> throw ds.e
+                DownloadStatus.DownloadCompleted -> { /* terminal, Flow will end */ }
+                else -> { /* DownloadStarted / DownloadProgress — just wait */ }
+            }
+        }
+        return client().checkStatus()
     }
 
     /**
@@ -70,6 +121,41 @@ object AICoreEngine {
         STATUS_DOWNLOADING -> "downloading"
         STATUS_UNAVAILABLE -> "unavailable"
         else -> "unknown($code)"
+    }
+
+    /**
+     * Diagnostic: probe checkStatus() under every (releaseStage × preference)
+     * combination so a caller can figure out which variant of Gemini Nano the
+     * device actually has provisioned. Returns a map keyed by `"stage/pref"`
+     * with status code values. Used by `GET /v1/aicore/status`.
+     *
+     * Each probe spins up a one-off client and doesn't touch the shared
+     * [clientRef] — switching the cached client mid-session would surprise
+     * anyone already mid-stream.
+     */
+    suspend fun probeAllConfigs(): Map<String, Int> {
+        val combos = listOf(
+            "stable/fast" to (ModelReleaseStage.STABLE to ModelPreference.FAST),
+            "stable/full" to (ModelReleaseStage.STABLE to ModelPreference.FULL),
+            "preview/fast" to (ModelReleaseStage.PREVIEW to ModelPreference.FAST),
+            "preview/full" to (ModelReleaseStage.PREVIEW to ModelPreference.FULL),
+        )
+        val out = LinkedHashMap<String, Int>()
+        for ((label, sp) in combos) {
+            val (stage, pref) = sp
+            val cfg = generationConfig {
+                modelConfig = modelConfig {
+                    releaseStage = stage
+                    preference = pref
+                }
+            }
+            out[label] = try {
+                Generation.getClient(cfg).checkStatus()
+            } catch (e: Throwable) {
+                -1
+            }
+        }
+        return out
     }
 
     /**

@@ -28,6 +28,15 @@ data class ModelInfo(
      * `nativeLibraryDir` — see [Settings.hasNpuDelegate].
      */
     val requiredSocMarker: String? = null,
+    /**
+     * Virtual entries are served by something other than a `.litertlm`
+     * file on disk — e.g. AICore (Gemini Nano) goes through the ML Kit
+     * Prompt API. Empty [url] / [filename], no Download/Delete UI, and
+     * the Models tab renders a static "provided by X" chip instead.
+     * Always considered "available" at the catalog level; per-request
+     * availability is the engine's problem.
+     */
+    val isVirtual: Boolean = false,
 )
 
 /**
@@ -180,5 +189,20 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         // Pixel 10's Tensor G5 reports SoC codename "LAGUNA" via
         // ro.soc.model — not "Tensor G5". Verified on a Frankel device.
         requiredSocMarker = "laguna",
+    ),
+    ModelInfo(
+        // Virtual entry — no .litertlm on disk. Served by ML Kit GenAI
+        // Prompt API (com.google.mlkit:genai-prompt) against the AICore
+        // system service. Chat handler routes this `id` to the AICore
+        // bypass path. Real availability is gated by the device shipping
+        // a beta2-compatible AICore + having Gemini Nano provisioned;
+        // when that's not the case the chat call returns a structured
+        // error and the server stays alive. See aicore/AICoreEngine.kt.
+        id = com.localllm.app.aicore.AICoreEngine.MODEL_ID,
+        name = "Gemini Nano · AICore",
+        description = "System-provided Gemini Nano via Google AICore. No download — Android manages the model. Requires Pixel 8+ with a compatible AICore build; on a fresh device the model may take a while to provision in the background.",
+        url = "",
+        filename = "",
+        isVirtual = true,
     ),
 )
