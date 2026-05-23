@@ -546,7 +546,16 @@ class LLMServerService : Service() {
                                 if (resolveVocabFor(modelId) == null) null
                                 else ModelData(id = modelId, created = file.lastModified() / 1000)
                             }
-                        call.respond(ModelListResponse(data = llmModels + embModels))
+                        // Virtual entry for the AICore (Gemini Nano) backend.
+                        // Listed unconditionally so clients can probe; the
+                        // chat handler surfaces a clean error if AICore isn't
+                        // installed or the model isn't downloaded yet.
+                        val aicoreModel = ModelData(
+                            id = com.localllm.app.aicore.AICoreEngine.MODEL_ID,
+                            created = System.currentTimeMillis() / 1000,
+                            ownedBy = "google-aicore",
+                        )
+                        call.respond(ModelListResponse(data = llmModels + embModels + aicoreModel))
                     }
 
                     post("/v1/embeddings") {
@@ -1034,12 +1043,75 @@ class LLMServerService : Service() {
                         try {
                             LogManager.i("LLMServerService", "Request #${entry.id} from $remoteIp [$ua]: model=${req.model}, stream=${req.stream}, msgs=${req.messages.size}, chars=$promptChars, session=${req.sessionId?.ifEmpty { null } ?: "(stateless)"}")
 
-                            val handle = getOrCreateEngine(req)
+                            val responseId = "chatcmpl-${entry.id}"
                             val temp = req.temperature ?: Settings.temperature(this@LLMServerService)
                             val topK = req.topK ?: Settings.topK(this@LLMServerService)
+
+                            // AICore (Gemini Nano) bypass. No LiteRT-LM engine,
+                            // no .litertlm on disk, no inferenceMutex — AICore
+                            // runs in the system service and handles its own
+                            // serialization. Sessions / KV reuse don't apply;
+                            // every call is stateless from our side.
+                            if (req.model == com.localllm.app.aicore.AICoreEngine.MODEL_ID) {
+                                val status = com.localllm.app.aicore.AICoreEngine.checkStatusCode()
+                                if (status != com.localllm.app.aicore.AICoreEngine.STATUS_AVAILABLE) {
+                                    throw IllegalStateException(
+                                        "AICore (Gemini Nano) is ${com.localllm.app.aicore.AICoreEngine.statusLabel(status)} on this device. " +
+                                        "Requires Pixel 8+ with the AICore system service; on a fresh device the model may need to download via AICore before the first call succeeds."
+                                    )
+                                }
+                                val flatPrompt = flattenForAICore(req.messages)
+                                if (req.stream) {
+                                    call.response.cacheControl(CacheControl.NoCache(null))
+                                    call.respondBytesWriter(contentType = ContentType.Text.EventStream) {
+                                        streamWriter = this@respondBytesWriter
+                                        withTimeout(timeoutMs) {
+                                            RequestTracker.markStarted(entry.id)
+                                            runAICoreStreaming(
+                                                writer = this@respondBytesWriter,
+                                                prompt = flatPrompt,
+                                                temperature = temp,
+                                                topK = topK,
+                                                maxOutputTokens = req.maxTokens,
+                                                responseId = responseId,
+                                                modelName = req.model,
+                                                requestEntryId = entry.id,
+                                                onChunk = { delta -> RequestTracker.recordChunk(entry.id, delta) },
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    val text = withTimeout(timeoutMs) {
+                                        RequestTracker.markStarted(entry.id)
+                                        com.localllm.app.aicore.AICoreEngine.complete(
+                                            prompt = flatPrompt,
+                                            temperature = temp,
+                                            topK = topK,
+                                            maxOutputTokens = req.maxTokens,
+                                        )
+                                    }
+                                    RequestTracker.recordChunk(entry.id, text)
+                                    call.respond(ChatResponse(
+                                        id = responseId,
+                                        `object` = "chat.completion",
+                                        created = System.currentTimeMillis() / 1000,
+                                        model = req.model,
+                                        choices = listOf(Choice(
+                                            index = 0,
+                                            message = Message(role = "assistant", content = stringContent(text)),
+                                            finishReason = "stop",
+                                        )),
+                                    ))
+                                }
+                                inferenceOk = true
+                                RequestTracker.markCompleted(entry.id)
+                                lastActivityAt.set(System.currentTimeMillis())
+                                return@post
+                            }
+
+                            val handle = getOrCreateEngine(req)
                             val resolvedLocal = resolveSession(req, handle, temp, topK)
                             resolved = resolvedLocal
-                            val responseId = "chatcmpl-${entry.id}"
                             val needWakeLock = Settings.keepAwake(this@LLMServerService)
 
                             if (req.stream) {
@@ -1344,6 +1416,102 @@ class LLMServerService : Service() {
      */
     private fun runInferenceBlocking(conversation: Conversation, prompt: LlmMessage): LlmMessage {
         return conversation.sendMessage(prompt, emptyMap())
+    }
+
+    /**
+     * Flatten an OpenAI chat-history into a single string prompt for AICore.
+     *
+     * AICore's `GenerateContentRequest` takes a `TextPart(string)`; there is
+     * no first-class system / role slot the way OpenAI exposes. So we render
+     * the conversation as labelled turns and append a bare `assistant:`
+     * suffix to cue the model toward the next reply. Multimodal parts are
+     * collapsed to their text fragments; image inputs aren't forwarded (the
+     * SDK supports them via `ImagePart`, but wiring multimodal through this
+     * one-string contract isn't worth it until a caller asks).
+     */
+    private fun flattenForAICore(messages: List<Message>): String {
+        val sb = StringBuilder()
+        for (m in messages) {
+            val text = m.contentString() ?: m.contentParts()
+                .filterIsInstance<ContentPart.TextPart>()
+                .joinToString(" ") { it.text }
+            if (text.isBlank()) continue
+            val label = when (m.role) {
+                "system" -> "system"
+                "assistant" -> "assistant"
+                "tool" -> "tool"
+                else -> "user"
+            }
+            sb.append(label).append(": ").append(text).append("\n\n")
+        }
+        sb.append("assistant: ")
+        return sb.toString()
+    }
+
+    /**
+     * Stream AICore output back to [writer] in the OpenAI SSE shape used by
+     * the rest of `/v1/chat/completions`. AICore emits cumulative text on
+     * each `GenerateContentResponse`, so we compute the delta vs the prior
+     * chunk before forwarding — same trick `runInferenceStreaming` uses for
+     * LiteRT-LM's prefix-style emissions.
+     */
+    private suspend fun runAICoreStreaming(
+        writer: io.ktor.utils.io.ByteWriteChannel,
+        prompt: String,
+        temperature: Float?,
+        topK: Int?,
+        maxOutputTokens: Int?,
+        responseId: String,
+        modelName: String,
+        requestEntryId: String,
+        onChunk: (String) -> Unit,
+    ) {
+        suspend fun safeWrite(s: String) {
+            try { writer.writeStringUtf8(s); writer.flush() } catch (_: Throwable) { /* peer gone */ }
+        }
+        // OpenAI streams emit a role-only delta first, then content deltas.
+        val initResp = StreamResponse(
+            id = responseId,
+            `object` = "chat.completion.chunk",
+            created = System.currentTimeMillis() / 1000,
+            model = modelName,
+            choices = listOf(StreamChoice(0, StreamDelta(role = "assistant"), null)),
+        )
+        safeWrite("data: ${gson.toJson(initResp)}\n\n")
+
+        var prev = ""
+        com.localllm.app.aicore.AICoreEngine.stream(
+            prompt = prompt,
+            temperature = temperature,
+            topK = topK,
+            maxOutputTokens = maxOutputTokens,
+        ).collect { full ->
+            val delta = when {
+                full.startsWith(prev) && full.length > prev.length -> full.substring(prev.length)
+                full == prev -> ""
+                else -> full // not a prefix → emit verbatim
+            }
+            if (delta.isEmpty()) return@collect
+            prev = if (full.startsWith(prev)) full else prev + delta
+            onChunk(delta)
+            val chunkResp = StreamResponse(
+                id = responseId,
+                `object` = "chat.completion.chunk",
+                created = System.currentTimeMillis() / 1000,
+                model = modelName,
+                choices = listOf(StreamChoice(0, StreamDelta(content = delta), null)),
+            )
+            safeWrite("data: ${gson.toJson(chunkResp)}\n\n")
+        }
+        val finalResp = StreamResponse(
+            id = responseId,
+            `object` = "chat.completion.chunk",
+            created = System.currentTimeMillis() / 1000,
+            model = modelName,
+            choices = listOf(StreamChoice(0, StreamDelta(), "stop")),
+        )
+        safeWrite("data: ${gson.toJson(finalResp)}\n\n")
+        safeWrite("data: [DONE]\n\n")
     }
 
     /**

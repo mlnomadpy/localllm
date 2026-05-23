@@ -15,13 +15,6 @@
           "flags": 1
         },
         {
-          "id": "8:5829164738291047365",
-          "name": "tenantId",
-          "indexId": "3:9182736450918273645",
-          "type": 9,
-          "flags": 2048
-        },
-        {
           "id": "2:2016911524440942947",
           "name": "documentId",
           "indexId": "1:2495076683268836592",
@@ -54,6 +47,13 @@
           "indexId": "2:830951815790880836",
           "type": 28,
           "flags": 8
+        },
+        {
+          "id": "8:5829164738291047365",
+          "name": "tenantId",
+          "indexId": "3:9182736450918273645",
+          "type": 9,
+          "flags": 2048
         }
       ],
       "relations": []
@@ -69,5 +69,5 @@
   "retiredIndexUids": [],
   "retiredPropertyUids": [],
   "retiredRelationUids": [],
-  "version": 2
+  "version": 1
 }
