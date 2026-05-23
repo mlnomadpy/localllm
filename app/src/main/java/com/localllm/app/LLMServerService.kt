@@ -529,6 +529,28 @@ class LLMServerService : Service() {
                         ))
                     }
 
+                    /* ----- /v1/aicore/status (diagnostic probe across configs) ----- */
+                    get("/v1/aicore/status") {
+                        if (!authorize(call)) return@get
+                        val probe = try {
+                            com.localllm.app.aicore.AICoreEngine.probeAllConfigs()
+                                .mapValues { (_, v) ->
+                                    mapOf(
+                                        "code" to v,
+                                        "label" to com.localllm.app.aicore.AICoreEngine.statusLabel(v),
+                                    )
+                                }
+                        } catch (e: Throwable) {
+                            mapOf("error" to (e.message ?: e.javaClass.simpleName))
+                        }
+                        call.respond(mapOf(
+                            "soc_model" to (android.os.Build.SOC_MODEL ?: "unknown"),
+                            "device" to android.os.Build.DEVICE,
+                            "manufacturer" to android.os.Build.MANUFACTURER,
+                            "configs" to probe,
+                        ))
+                    }
+
                     get("/v1/models") {
                         if (!authorize(call)) return@get
                         val dir = getExternalFilesDir(null)
@@ -1053,11 +1075,16 @@ class LLMServerService : Service() {
                             // serialization. Sessions / KV reuse don't apply;
                             // every call is stateless from our side.
                             if (req.model == com.localllm.app.aicore.AICoreEngine.MODEL_ID) {
-                                val status = com.localllm.app.aicore.AICoreEngine.checkStatusCode()
+                                // ensureReady drives the AICore download itself
+                                // when status is DOWNLOADABLE/DOWNLOADING, so a
+                                // first-ever call on a fresh device blocks here
+                                // instead of failing fast. May take minutes the
+                                // first time — the request timeout caps it.
+                                val status = com.localllm.app.aicore.AICoreEngine.ensureReady()
                                 if (status != com.localllm.app.aicore.AICoreEngine.STATUS_AVAILABLE) {
                                     throw IllegalStateException(
                                         "AICore (Gemini Nano) is ${com.localllm.app.aicore.AICoreEngine.statusLabel(status)} on this device. " +
-                                        "Requires Pixel 8+ with the AICore system service; on a fresh device the model may need to download via AICore before the first call succeeds."
+                                        "Requires Pixel 8+ with a compatible AICore build. If your device is in the AICore Developer Preview the model may still be provisioning in the background."
                                     )
                                 }
                                 val flatPrompt = flattenForAICore(req.messages)
