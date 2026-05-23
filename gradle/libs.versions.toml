@@ -9,6 +9,7 @@ composeBom = "2024.09.02"
 okhttp = "4.12.0"
 ktor = "3.4.3"
 litertlm = "0.12.0"
+mlkitGenaiPrompt = "1.0.0-beta2"
 datastore = "1.1.1"
 commonmark = "0.22.0"
 onnxruntime = "1.18.0"
@@ -46,6 +47,7 @@ ktor-server-content-negotiation = { module = "io.ktor:ktor-server-content-negoti
 ktor-serialization-gson = { module = "io.ktor:ktor-serialization-gson", version.ref = "ktor" }
 
 litertlm-android = { module = "com.google.ai.edge.litertlm:litertlm-android", version.ref = "litertlm" }
+mlkit-genai-prompt = { module = "com.google.mlkit:genai-prompt", version.ref = "mlkitGenaiPrompt" }
 
 commonmark = { module = "org.commonmark:commonmark", version.ref = "commonmark" }
 onnxruntime-android = { module = "com.microsoft.onnxruntime:onnxruntime-android", version.ref = "onnxruntime" }

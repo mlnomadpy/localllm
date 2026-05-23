@@ -138,6 +138,13 @@ dependencies {
     // LiteRT-LM (on-device Gemma 4 / 3n via Google's LLM runtime; replaces MediaPipe tasks-genai)
     implementation(libs.litertlm.android)
 
+    // ML Kit GenAI Prompt API — Gemini Nano via AICore. Optional second
+    // backend exposed as the magic model id `gemini-nano-aicore`, lets us
+    // bypass the LiteRT-LM path on devices where AICore is available
+    // (Pixel 8+). Beta — see
+    // developers.google.com/ml-kit/genai/aicore-dev-preview.
+    implementation(libs.mlkit.genai.prompt)
+
     // OkHttp for the in-app Chat tab that hits the local server
     implementation(libs.okhttp)
     implementation(libs.okhttp.sse)
