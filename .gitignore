@@ -22,3 +22,11 @@ app/build
 
 # Claude Code agent worktrees
 /.claude/
+
+# Host-JVM native libs dropped by ObjectBox when running unit tests on Mac/Windows.
+# (Android .so files under app/src/main/jniLibs/ are intentionally tracked.)
+*.dylib
+*.dll
+
+# Local scratch notes / deferred-audit artefacts
+/.context/
