@@ -48,7 +48,7 @@ object ServerEngine {
             }
             routing {
                 healthRoute(deps.engineRegistry)
-                modelsRoute(deps)
+                modelsRoute(deps.appContext, deps.embeddingRegistry)
                 embeddingsRoute(deps)
                 documentsRoute(deps)
                 aiCoreRoute(deps)
