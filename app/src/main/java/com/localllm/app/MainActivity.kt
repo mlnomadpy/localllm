@@ -266,11 +266,14 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            LaunchedEffect(existingModels.isNotEmpty(), hasNotificationPermission) {
+            // Autostart no longer requires a `.litertlm` on disk — AICore
+            // (the default model) is a virtual catalog entry served by the
+            // system, so a fresh install with zero local models should still
+            // bring the server up. LiteRT models remain selectable on top.
+            LaunchedEffect(hasNotificationPermission) {
                 if (!hasNotificationPermission && Build.VERSION.SDK_INT >= 33) {
                     permLauncher.launch("android.permission.POST_NOTIFICATIONS")
                 } else if (Settings.autostart(context) &&
-                    existingModels.isNotEmpty() &&
                     serverStatus == ServerState.Status.STOPPED
                 ) {
                     startServer()
@@ -283,7 +286,6 @@ class MainActivity : ComponentActivity() {
                     if (event == Lifecycle.Event.ON_START &&
                         ServerState.status.value == ServerState.Status.STOPPED &&
                         Settings.autostart(context) &&
-                        existingModels.isNotEmpty() &&
                         hasNotificationPermission
                     ) {
                         startServer()

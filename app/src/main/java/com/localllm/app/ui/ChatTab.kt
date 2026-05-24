@@ -65,6 +65,7 @@ import androidx.compose.ui.unit.dp
 import com.localllm.app.AVAILABLE_MODELS
 import com.localllm.app.LogManager
 import com.localllm.app.R
+import com.localllm.app.inference.aicore.AICoreEngine
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -317,6 +318,18 @@ private fun ChatHeaderRow(
                 expanded = menuOpen,
                 onDismissRequest = { menuOpen = false },
             ) {
+                // AICore (Gemini Nano) — always selectable. It's a virtual
+                // catalog entry with no file on disk, so it's not in
+                // `existingModels`; surface it unconditionally so the user
+                // can pick the default model without first downloading a
+                // `.litertlm` file.
+                DropdownMenuItem(
+                    text = { Text("Gemini Nano · AICore  (default)") },
+                    onClick = {
+                        onModelChange(AICoreEngine.MODEL_ID)
+                        menuOpen = false
+                    },
+                )
                 existingModels.forEach { modelName ->
                     DropdownMenuItem(
                         text = { Text(displayLabelFor(modelName)) },
