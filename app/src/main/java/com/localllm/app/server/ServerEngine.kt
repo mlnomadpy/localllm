@@ -49,7 +49,7 @@ object ServerEngine {
             routing {
                 healthRoute(deps.engineRegistry)
                 modelsRoute(deps.appContext, deps.embeddingRegistry)
-                embeddingsRoute(deps)
+                embeddingsRoute(deps.appContext, deps.embeddingRegistry, deps.lastActivityAt)
                 documentsRoute(deps)
                 aiCoreRoute(deps.appContext)
                 benchmarkRoute(deps.appContext, deps.lastActivityAt)
