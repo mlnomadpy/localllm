@@ -52,7 +52,7 @@ object ServerEngine {
                 embeddingsRoute(deps)
                 documentsRoute(deps)
                 aiCoreRoute(deps.appContext)
-                benchmarkRoute(deps)
+                benchmarkRoute(deps.appContext, deps.lastActivityAt)
                 chatRoute(deps)
             }
         }
