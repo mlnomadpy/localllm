@@ -51,7 +51,7 @@ object ServerEngine {
                 modelsRoute(deps.appContext, deps.embeddingRegistry)
                 embeddingsRoute(deps)
                 documentsRoute(deps)
-                aiCoreRoute(deps)
+                aiCoreRoute(deps.appContext)
                 benchmarkRoute(deps)
                 chatRoute(deps)
             }
