@@ -50,7 +50,10 @@ Runtime versions are all locked in `gradle/libs.versions.toml`:
 | AGP | 8.7.3 |
 | Ktor | 3.4.3 |
 | Compose BOM | 2024.09.02 |
-| LiteRT-LM | 0.11.0 |
+| LiteRT-LM | 0.12.0 |
+| ML Kit GenAI Prompt | 1.0.0-beta2 |
+| ONNX Runtime Android | 1.18.0 |
+| ObjectBox | 4.0.3 |
 
 ## Adding a model to the catalog
 
@@ -88,20 +91,32 @@ post-2022 should manage 10–30 tok/s on CPU.
 Tested on Pixel-class devices. NPU acceleration via the Qualcomm
 `.litertlm` variants requires a Snapdragon device.
 
-## GPU vs CPU on your device
+## Picking a backend on your device
 
-The AUTO backend tries GPU first and falls back to CPU on any
-`Engine.initialize()` failure. The most common GPU failure on stock
-Pixel images is `dlopen failed: library libvndksupport.so not found`
-— Google ships `libvndksupport.so` on some images but not others. If
-you see this and want to force CPU explicitly (skip the failed GPU
-attempt), set **Settings → Backend → CPU**.
+LiteRT-LM AUTO tries **NPU → GPU → CPU** and records every step. The
+NPU attempt is only meaningful when the device has a vendor delegate
+reachable from `nativeLibraryDir` (QAIRT, NeuroPilot) or, on Pixel
+6/9/10, the bundled `libLiteRtDispatch_GoogleTensor.so`. The most
+common GPU failure on stock Pixel images is `dlopen failed: library
+libvndksupport.so not found`. Force a specific backend in **Settings
+→ Backend** if you want to skip the chain.
 
-To see what your device picked, `curl /health`:
+AICore (`gemini-nano-aicore`) doesn't expose a backend selector —
+the AICore system service picks NPU/GPU/CPU internally.
+
+To see what your LiteRT engine picked, `curl /health`:
 
 ```bash
-curl -s http://localhost:8099/health | jq '.engines'
-# [{"key":"gemma-4-e2b_model_AUTO","backend":"CPU"}]
+curl -s http://localhost:8099/health | jq '.engines[0]'
+# {
+#   "key": "gemma-4-e2b_model_AUTO",
+#   "backend": "CPU",
+#   "attempts": [
+#     {"backend":"NPU","result":"failed: TF_LITE_AUX not found in the model","duration_ms":5394},
+#     {"backend":"GPU","result":"skipped: known SIGSEGV on Tensor","duration_ms":0},
+#     {"backend":"CPU","result":"ok","duration_ms":3168}
+#   ]
+# }
 ```
 
 ## Tests
@@ -315,7 +330,7 @@ Only `lib/arm64-v8a/...` entries should appear in the per-ABI APK.
 
 ### LiteRT-LM ABI gotcha
 
-The `com.google.ai.edge.litertlm:litertlm-android:0.11.0` AAR ships
+The `com.google.ai.edge.litertlm:litertlm-android:0.12.0` AAR ships
 JNI `.so` files for **`arm64-v8a` and `x86_64` only**:
 
 - `lib/arm64-v8a/`: `libLiteRt.so`, `libLiteRtClGlAccelerator.so`,
