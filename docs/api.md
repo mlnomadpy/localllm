@@ -49,10 +49,16 @@ curl -s http://localhost:8099/health
   do **not** appear here; they run inside the AICore system service.
 - `engines[].key` — engine cache key in the shape
   `<model>_<maxTokens|"model">_<backend>`.
-- `engines[].backend` — the backend the engine actually initialized
-  on, after the AUTO chain resolved (`NPU`, `GPU`, or `CPU`).
-- `engines[].attempts` — full chain with `result` (`ok` / `failed: …`
-  / `skipped: …`) and `duration_ms` per step.
+- `engines[].backend` — the backend declared for this model in the
+  catalog (`LITERT_CPU`, `LITERT_GPU`, or `LITERT_NPU`). Each engine
+  records the single init attempt that built it; no AUTO chain.
+- `engines[].attempts` — the init record for the declared backend with
+  `result` (`ok` / `failed: …`) and `duration_ms`. Single entry now —
+  the AUTO chain was removed.
+- `aicore` — readiness of Gemini Nano: `{status_code, status,
+  model_id, is_default: true}`. On a device where the AICore probe
+  throws (e.g. service not installed), `status_code` is `null` and
+  `error` carries the SDK message.
 
 ## `GET /v1/models` { #models }
 
@@ -92,7 +98,7 @@ clients should know about:
 
 | | AICore (`gemini-nano-aicore`) | LiteRT-LM (e.g. `gemma-4-e2b`) |
 |---|---|---|
-| Backend selection | Decided by AICore. No surface. | AUTO chain (NPU → GPU → CPU) or explicit. |
+| Backend selection | Decided by AICore. No surface. | Declared per-model in the catalog (`Backend.LITERT_CPU` / `_GPU` / `_NPU`). No fallback chain. |
 | `session_id` (KV reuse) | Ignored. Stateless. History is flattened into one prompt. | Honored — see [multi-turn](#multi-turn-with-session_id). |
 | App lifecycle constraint | **Foreground only.** Backgrounded calls fail with ErrorCode 30. | None. |
 | `tools` / `tool_choice` | Not supported by the SDK. | Honored. |

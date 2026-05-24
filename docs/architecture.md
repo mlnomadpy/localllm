@@ -2,13 +2,25 @@
 
 The app is one Gradle module — `:app` — containing both the Compose
 UI and the foreground Service that hosts two inference engines (AICore
-+ LiteRT-LM) and the HTTP server. Source is laid out flat under
-`com.localllm.app` with three thin packages so far: `aicore/` (the ML
-Kit GenAI wrapper), `embedding/` (ONNX Runtime + WordPiece), and
-`rag/` (ObjectBox vector store, document chunker, tenant resolver).
-The Service and routing layer still live in a single
-`LLMServerService.kt` — splitting it into per-route files is on the
-roadmap.
++ LiteRT-LM) and the HTTP server. The source is feature-sliced under
+`com.localllm.app`:
+
+- `server/` — Ktor lifecycle, `ServerEngine`, `ServerDeps`,
+  `RouteSupport`, and `server/auth/Authorize` for the bearer check.
+- `server/routes/` — one file per HTTP route group:
+  `HealthRoute`, `ModelsRoute`, `ChatRoute`, `EmbeddingsRoute`,
+  `DocumentsRoute`, `AICoreRoute`, `BenchmarkRoute`.
+- `inference/` — engine abstraction: `Engine`, `EngineRegistry`
+  (catalog-driven, no AUTO chain), `EmbeddingRegistry`,
+  `AiCoreNotReadyException`.
+- `inference/litert/` — `LiteRtEngine`, `LiteRtEngineBuilder`,
+  `TensorSoCDetector`, `LlmMessageConverter`, `SessionManager`.
+- `inference/aicore/` — `AICoreEngine`, `AICoreEngineAdapter`,
+  `AICoreBenchmark`.
+- `embedding/` — ONNX Runtime + WordPiece.
+- `rag/` — ObjectBox vector store, document chunker, tenant resolver.
+- `LLMServerService.kt` — the `Service` itself, ~366 lines of
+  lifecycle glue. (It was 2287 lines before the feature-sliced split.)
 
 The line between "UI" and "service" is hard: the service is process-
 global state (LRU caches, queue, request tracker), and the UI
@@ -204,21 +216,48 @@ already disconnected.
 
 ```
 app/src/main/java/com/localllm/app/
-├── ApiTypes.kt              OpenAI wire types (Gson @SerializedName)
+├── ApiTypes.kt              OpenAI wire types + RichErrorResponse / RichErrorDetails
 ├── BootReceiver.kt          autostart on device boot
-├── LLMServerService.kt      foreground service: Ktor + LiteRT-LM + AICore routing + caches
+├── LLMServerService.kt      foreground service: lifecycle, FGS notification, wiring (~366 lines)
 ├── LocalLLMApplication.kt   Application subclass
 ├── LogManager.kt            in-memory log ring buffer + Android Log
 ├── MainActivity.kt          Compose root, tab routing, file picker, download poll
-├── MessageHelpers.kt        pure JVM-testable helpers extracted from the service
-├── ModelCatalog.kt          AVAILABLE_MODELS + ModelInfo (sha256, requiredSocMarker)
+├── MessageHelpers.kt        pure JVM-testable helpers
+├── ModelCatalog.kt          AVAILABLE_MODELS + ModelInfo + Backend enum (AICORE/LITERT_CPU/GPU/NPU)
 ├── RateLimiter.kt           per-client token bucket
 ├── RequestTracker.kt        atomic queue + history + stats StateFlow + client summaries
-├── Settings.kt              DataStore-backed facade (with SharedPreferences migration)
+├── Settings.kt              DataStore-backed facade (DEFAULT_MODEL_ID = gemini-nano-aicore)
 ├── SettingsRepository.kt    StateFlow-backed observable layer
 ├── Theme.kt                 dark Material 3 color scheme
-├── aicore/
-│   └── AICoreEngine.kt      ML Kit GenAI Prompt API wrapper (gemini-nano-aicore)
+├── server/
+│   ├── ServerEngine.kt      Ktor embeddedServer + module wiring
+│   ├── ServerDeps.kt        shared dependency bundle for routes
+│   ├── RouteSupport.kt      tenantFromCall, respondWithTenant
+│   ├── auth/
+│   │   └── Authorize.kt     bearer-token check
+│   └── routes/
+│       ├── HealthRoute.kt        GET /health (with aicore block)
+│       ├── ModelsRoute.kt        GET /v1/models
+│       ├── ChatRoute.kt          POST /v1/chat/completions (structured error envelopes)
+│       ├── EmbeddingsRoute.kt    POST /v1/embeddings
+│       ├── DocumentsRoute.kt     RAG document + search + tenants
+│       ├── AICoreRoute.kt        GET /v1/aicore/status
+│       └── BenchmarkRoute.kt     POST/GET /v1/aicore/benchmark
+├── inference/
+│   ├── Engine.kt                 Engine + TextStreamingEngine interfaces
+│   ├── EngineRegistry.kt         catalog-driven backend dispatch, LRU(2) for LiteRT, no fallback
+│   ├── EmbeddingRegistry.kt      LRU(1) of ONNX embedding services
+│   ├── AiCoreNotReadyException.kt typed exception with SDK status code
+│   ├── litert/
+│   │   ├── LiteRtEngine.kt          Engine wrapper around native LiteRT engine
+│   │   ├── LiteRtEngineBuilder.kt   builds engines on catalog-declared backend
+│   │   ├── TensorSoCDetector.kt     Tensor codename detection (filtering only, not selection)
+│   │   ├── LlmMessageConverter.kt   OpenAI ↔ LiteRT-LM conversion + image fetch
+│   │   └── SessionManager.kt        KV-cache conversation reuse across turns
+│   └── aicore/
+│       ├── AICoreEngine.kt          ML Kit GenAI Prompt API wrapper (gemini-nano-aicore)
+│       ├── AICoreEngineAdapter.kt   TextStreamingEngine implementation
+│       └── AICoreBenchmark.kt       TTFT + tok/s + total-ms speed test
 ├── embedding/
 │   ├── EmbeddingService.kt  ONNX Runtime + idle eviction
 │   └── WordPieceTokenizer.kt BERT WordPiece in pure Kotlin
@@ -231,18 +270,13 @@ app/src/main/java/com/localllm/app/
     ├── AppTab.kt            enum + UiMessage data class
     ├── ChatBubble.kt / ChatEmptyState.kt / ChatTab.kt
     ├── ConsoleTab.kt        log viewer
-    ├── DashboardTab.kt      live queue / stats / history + per-client summaries
+    ├── DashboardTab.kt      live queue/stats/history + AICore benchmark card
     ├── DocumentApiClient.kt / DocumentsTab.kt
     ├── Header.kt            status dot helper
     ├── MarkdownText.kt      commonmark-backed renderer
-    ├── ModelsTab.kt         catalog + custom URLs + import + SoC-aware chips
+    ├── ModelsTab.kt         catalog + live AICore status card + custom URLs + import
     └── SettingsTab.kt       settings UI, observes SettingsRepository
 ```
-
-`LLMServerService.kt` is still a monolith (~2.3k lines). Splitting
-routes / engine resolution / session management into per-file
-packages (`server/routes/`, `inference/{litert,aicore}/`) is on the
-roadmap but hasn't landed yet.
 
 Tests live in `app/src/test/java/com/localllm/app/` —
 `SettingsTest.kt`, `RequestTrackerTest.kt`, `ApiTypesTest.kt`,

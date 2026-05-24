@@ -348,14 +348,33 @@ the universal APK works for smoke tests.
 ## Roadmap
 
 Tracked in [GitHub Issues](https://github.com/mlnomadpy/localllm/issues).
-Big items:
 
-- [ ] Multimodal content blocks (`Content.ImageBytes` /
-      `Content.AudioBytes`) — LiteRT-LM already supports them.
-- [ ] Tool / function calling (`ConversationConfig.tools`).
-- [ ] Qualcomm NPU catalog entries
-      (`gemma-4-E2B-it_qualcomm_sm8750.litertlm`).
-- [ ] Per-IP token-bucket rate limiting.
+**Shipped this cycle**
+
+- AICore (Gemini Nano) as the default engine (`Settings.DEFAULT_MODEL_ID
+  = "gemini-nano-aicore"`).
+- AUTO backend chain removed — `Backend` enum declared per-model in the
+  catalog; no fallback.
+- Feature-sliced split of `LLMServerService.kt` (2287 → ~366 lines).
+  Routes under `server/routes/`, engines under `inference/litert/` and
+  `inference/aicore/`.
+- Structured error envelopes (`RichErrorResponse` / `RichErrorDetails`):
+  `AICORE_DOWNLOADABLE`, `AICORE_DOWNLOADING`, `AICORE_UNAVAILABLE`,
+  `AICORE_BACKGROUND_BLOCKED`, `AICORE_RUNTIME_ERROR`,
+  `LITERT_INIT_FAILED`.
+- `GET /v1/aicore/status` and `POST/GET /v1/aicore/benchmark` (TTFT,
+  tok/s, total-ms).
+- `aicore` block in `/health`.
+- Multimodal `image_url` content blocks (LiteRT path).
+- Tool / function calling.
+- Qualcomm + MediaTek + Tensor G5 NPU catalog entries.
+- Release signing + R8 production build.
+
+**Open**
+
+- [ ] `Content.AudioBytes` multimodal input (LiteRT-LM supports it; the
+      OpenAI-compat layer doesn't yet).
+- [ ] Per-IP token-bucket rate limiting (currently per-User-Agent).
 - [ ] Persistent log buffer + Sentry/Crashlytics integration.
 - [ ] `androidTest` end-to-end with a tiny fixture model.
-- [ ] Release signing + R8 production build.
+- [ ] Multi-process isolation for engine crashes (issue #11).

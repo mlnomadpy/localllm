@@ -23,11 +23,14 @@ SoC variants). No cloud, no remote API key, no data leaves the device.
 
     ---
 
-    AICore (Gemini Nano) via `com.google.mlkit:genai-prompt:1.0.0-beta2`
-    when the device supports it, LiteRT-LM
-    (`com.google.ai.edge.litertlm:litertlm-android:0.12.0`) for everything
-    else. The LiteRT AUTO chain tries NPU → GPU → CPU and surfaces every
-    attempt in `GET /health`.
+    **AICore (Gemini Nano)** via `com.google.mlkit:genai-prompt:1.0.0-beta2`
+    is the default — `gemini-nano-aicore` is `Settings.DEFAULT_MODEL_ID`.
+    **LiteRT-LM** (`com.google.ai.edge.litertlm:litertlm-android:0.12.0`)
+    is the alternative for offline weights, custom `.litertlm` bundles, or
+    NPU-compiled SoC variants. Each catalog entry declares its `Backend`
+    (`AICORE` / `LITERT_CPU` / `LITERT_GPU` / `LITERT_NPU`) — no fallback
+    chain. `GET /health` exposes the live AICore status and the cached
+    LiteRT engines.
 
     [:octicons-arrow-right-24: Architecture](architecture.md)
 
