@@ -1,5 +1,6 @@
 package com.localllm.app.server.routes
 
+import android.content.Context
 import com.localllm.app.EmbeddingData
 import com.localllm.app.EmbeddingRequest
 import com.localllm.app.EmbeddingResponse
@@ -8,14 +9,15 @@ import com.localllm.app.ErrorDetails
 import com.localllm.app.ErrorResponse
 import com.localllm.app.LogManager
 import com.localllm.app.Settings
+import com.localllm.app.inference.EmbeddingRegistry
 import com.localllm.app.inputStrings
-import com.localllm.app.server.ServerDeps
 import com.localllm.app.server.auth.authorize
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.post
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * `POST /v1/embeddings` — OpenAI-compatible. Uses ONNX models via the
@@ -24,10 +26,14 @@ import io.ktor.server.routing.post
  * applies as for chat: a massive doc POSTed here gets the same 413 it'd get
  * from chat.
  */
-fun Route.embeddingsRoute(deps: ServerDeps) {
+fun Route.embeddingsRoute(
+    appContext: Context,
+    embeddingRegistry: EmbeddingRegistry,
+    lastActivityAt: AtomicLong,
+) {
     post("/v1/embeddings") {
-        if (!authorize(call, deps.appContext)) return@post
-        deps.lastActivityAt.set(System.currentTimeMillis())
+        if (!authorize(call, appContext)) return@post
+        lastActivityAt.set(System.currentTimeMillis())
 
         val req = try {
             call.receive<EmbeddingRequest>()
@@ -67,7 +73,7 @@ fun Route.embeddingsRoute(deps: ServerDeps) {
             return@post
         }
 
-        val maxChars = Settings.maxPromptChars(deps.appContext)
+        val maxChars = Settings.maxPromptChars(appContext)
         val totalChars = texts.sumOf { it.length }
         if (totalChars > maxChars) {
             call.respond(
@@ -82,7 +88,7 @@ fun Route.embeddingsRoute(deps: ServerDeps) {
         }
 
         val svc = try {
-            deps.embeddingRegistry.acquire(req.model)
+            embeddingRegistry.acquire(req.model)
         } catch (e: Exception) {
             call.respond(
                 HttpStatusCode.NotFound,

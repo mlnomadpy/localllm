@@ -1,9 +1,8 @@
 package com.localllm.app.server.routes
 
+import android.content.Context
 import com.localllm.app.inference.aicore.AICoreEngine
-import com.localllm.app.server.ServerDeps
 import com.localllm.app.server.auth.authorize
-import io.ktor.server.request.queryString
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
@@ -20,9 +19,9 @@ import io.ktor.server.routing.get
  * for diagnosing devices where the default `preview/fast` is unavailable
  * but another combination might be provisioned.
  */
-fun Route.aiCoreRoute(deps: ServerDeps) {
+fun Route.aiCoreRoute(appContext: Context) {
     get("/v1/aicore/status") {
-        if (!authorize(call, deps.appContext)) return@get
+        if (!authorize(call, appContext)) return@get
         val (code, probeError) = try {
             AICoreEngine.checkStatusCode() to null
         } catch (e: Throwable) {

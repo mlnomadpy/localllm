@@ -1,5 +1,6 @@
 package com.localllm.app.server.routes
 
+import android.content.Context
 import com.localllm.app.DocumentDeleteResponse
 import com.localllm.app.DocumentListResponse
 import com.localllm.app.DocumentRequest
@@ -14,9 +15,10 @@ import com.localllm.app.Settings
 import com.localllm.app.TenantDeleteResponse
 import com.localllm.app.TenantListResponse
 import com.localllm.app.TenantSummaryResponse
-import com.localllm.app.rag.DocumentChunk
+import com.localllm.app.inference.EmbeddingRegistry
 import com.localllm.app.rag.Chunker
-import com.localllm.app.server.ServerDeps
+import com.localllm.app.rag.DocumentChunk
+import com.localllm.app.rag.DocumentStore
 import com.localllm.app.server.auth.authorize
 import com.localllm.app.server.respondWithTenant
 import com.localllm.app.server.tenantFromCall
@@ -27,17 +29,27 @@ import io.ktor.server.routing.Route
 import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * `POST/GET/DELETE /v1/documents*`, `/v1/tenants*`, `POST /v1/search` —
  * the RAG corpus surface. Tenant resolution comes from headers via
  * [tenantFromCall]; responses include the tenant id both in the body and
  * as an `X-Tenant-Id` header so clients can verify the routing they got.
+ *
+ * [documentStore] is passed as a lazy supplier because the underlying
+ * ObjectBox store is built off the application context and lifetime-bound
+ * to the Service — routes shouldn't reach back into the Service to get it.
  */
-fun Route.documentsRoute(deps: ServerDeps) {
+fun Route.documentsRoute(
+    appContext: Context,
+    embeddingRegistry: EmbeddingRegistry,
+    documentStore: () -> DocumentStore,
+    lastActivityAt: AtomicLong,
+) {
     post("/v1/documents") {
-        if (!authorize(call, deps.appContext)) return@post
-        deps.lastActivityAt.set(System.currentTimeMillis())
+        if (!authorize(call, appContext)) return@post
+        lastActivityAt.set(System.currentTimeMillis())
         val tenantId = tenantFromCall(call)
 
         val req = try {
@@ -63,7 +75,7 @@ fun Route.documentsRoute(deps: ServerDeps) {
             return@post
         }
 
-        val maxChars = Settings.maxPromptChars(deps.appContext)
+        val maxChars = Settings.maxPromptChars(appContext)
         if (req.text.length > maxChars * 50) {
             call.respond(
                 HttpStatusCode.PayloadTooLarge,
@@ -88,7 +100,7 @@ fun Route.documentsRoute(deps: ServerDeps) {
         }
 
         val svc = try {
-            deps.embeddingRegistry.acquire(req.model)
+            embeddingRegistry.acquire(req.model)
         } catch (e: Exception) {
             call.respond(
                 HttpStatusCode.NotFound,
@@ -114,8 +126,8 @@ fun Route.documentsRoute(deps: ServerDeps) {
                     embedding = vectors[i].first,
                 )
             }
-            deps.documentStore().deleteDocument(tenantId, req.id)
-            deps.documentStore().put(entities)
+            documentStore().deleteDocument(tenantId, req.id)
+            documentStore().put(entities)
             call.respondWithTenant(
                 tenantId,
                 DocumentSummaryResponse(
@@ -138,9 +150,9 @@ fun Route.documentsRoute(deps: ServerDeps) {
     }
 
     get("/v1/documents") {
-        if (!authorize(call, deps.appContext)) return@get
+        if (!authorize(call, appContext)) return@get
         val tenantId = tenantFromCall(call)
-        val summaries = deps.documentStore().listDocuments(tenantId).map {
+        val summaries = documentStore().listDocuments(tenantId).map {
             DocumentSummaryResponse(
                 documentId = it.documentId,
                 chunkCount = it.chunkCount,
@@ -155,7 +167,7 @@ fun Route.documentsRoute(deps: ServerDeps) {
     }
 
     delete("/v1/documents/{id}") {
-        if (!authorize(call, deps.appContext)) return@delete
+        if (!authorize(call, appContext)) return@delete
         val tenantId = tenantFromCall(call)
         val id = call.parameters["id"]
         if (id.isNullOrBlank()) {
@@ -165,7 +177,7 @@ fun Route.documentsRoute(deps: ServerDeps) {
             )
             return@delete
         }
-        val n = deps.documentStore().deleteDocument(tenantId, id)
+        val n = documentStore().deleteDocument(tenantId, id)
         call.respondWithTenant(
             tenantId,
             DocumentDeleteResponse(
@@ -180,8 +192,8 @@ fun Route.documentsRoute(deps: ServerDeps) {
     /* ----- /v1/tenants (admin — global view, not tenant-scoped) ----- */
 
     get("/v1/tenants") {
-        if (!authorize(call, deps.appContext)) return@get
-        val summaries = deps.documentStore().listTenants().map {
+        if (!authorize(call, appContext)) return@get
+        val summaries = documentStore().listTenants().map {
             TenantSummaryResponse(
                 tenantId = it.tenantId,
                 documentCount = it.documentCount,
@@ -192,7 +204,7 @@ fun Route.documentsRoute(deps: ServerDeps) {
     }
 
     delete("/v1/tenants/{tenantId}") {
-        if (!authorize(call, deps.appContext)) return@delete
+        if (!authorize(call, appContext)) return@delete
         val tenantId = call.parameters["tenantId"]?.trim()?.lowercase().orEmpty()
         if (tenantId.isBlank()) {
             call.respond(
@@ -201,7 +213,7 @@ fun Route.documentsRoute(deps: ServerDeps) {
             )
             return@delete
         }
-        val n = deps.documentStore().deleteTenant(tenantId)
+        val n = documentStore().deleteTenant(tenantId)
         call.respond(TenantDeleteResponse(
             tenantId = tenantId,
             deleted = n > 0,
@@ -212,8 +224,8 @@ fun Route.documentsRoute(deps: ServerDeps) {
     /* ----- /v1/search (kNN over the document store) ----- */
 
     post("/v1/search") {
-        if (!authorize(call, deps.appContext)) return@post
-        deps.lastActivityAt.set(System.currentTimeMillis())
+        if (!authorize(call, appContext)) return@post
+        lastActivityAt.set(System.currentTimeMillis())
         val tenantId = tenantFromCall(call)
 
         val req = try { call.receive<SearchRequest>() } catch (e: Exception) {
@@ -236,7 +248,7 @@ fun Route.documentsRoute(deps: ServerDeps) {
         val k = (req.k ?: 5).coerceIn(1, 50)
 
         val svc = try {
-            deps.embeddingRegistry.acquire(req.model)
+            embeddingRegistry.acquire(req.model)
         } catch (e: Exception) {
             call.respond(
                 HttpStatusCode.NotFound,
@@ -250,7 +262,7 @@ fun Route.documentsRoute(deps: ServerDeps) {
 
         try {
             val queryVec = svc.embed(listOf(req.query)).first().first
-            val hits = deps.documentStore().nearest(tenantId, queryVec, k, req.model).map { (chunk, distance) ->
+            val hits = documentStore().nearest(tenantId, queryVec, k, req.model).map { (chunk, distance) ->
                 val cosine = 1f - distance
                 val metaJson: com.google.gson.JsonElement? = chunk.metadata?.let {
                     runCatching { com.google.gson.JsonParser.parseString(it) }.getOrNull()

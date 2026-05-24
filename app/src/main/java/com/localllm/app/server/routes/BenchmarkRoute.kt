@@ -1,11 +1,11 @@
 package com.localllm.app.server.routes
 
+import android.content.Context
 import com.google.gson.JsonParser
 import com.localllm.app.LogManager
 import com.localllm.app.inference.aicore.AICoreBenchmark
 import com.localllm.app.inference.aicore.AICoreBenchmarkCache
 import com.localllm.app.inference.aicore.AICoreEngine
-import com.localllm.app.server.ServerDeps
 import com.localllm.app.server.auth.authorize
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.request.receive
@@ -13,6 +13,7 @@ import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * `POST /v1/aicore/benchmark` — speed test for Gemini Nano. Body is
@@ -25,10 +26,13 @@ import io.ktor.server.routing.post
  *
  * Refuses when AICore is not AVAILABLE — no fallback, by policy.
  */
-fun Route.benchmarkRoute(deps: ServerDeps) {
+fun Route.benchmarkRoute(
+    appContext: Context,
+    lastActivityAt: AtomicLong,
+) {
     post("/v1/aicore/benchmark") {
-        if (!authorize(call, deps.appContext)) return@post
-        deps.lastActivityAt.set(System.currentTimeMillis())
+        if (!authorize(call, appContext)) return@post
+        lastActivityAt.set(System.currentTimeMillis())
 
         val statusCode = try {
             AICoreEngine.checkStatusCode()
@@ -90,7 +94,7 @@ fun Route.benchmarkRoute(deps: ServerDeps) {
     }
 
     get("/v1/aicore/benchmark") {
-        if (!authorize(call, deps.appContext)) return@get
+        if (!authorize(call, appContext)) return@get
         val last = AICoreBenchmarkCache.latest
         if (last == null) {
             call.respond(

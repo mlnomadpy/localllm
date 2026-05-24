@@ -27,6 +27,12 @@ import io.ktor.server.application.install
  * CORS is opt-in. Native HTTP clients don't need CORS headers, so the safe
  * default is "no CORS plugin" — that way a random web page can't drive the
  * API from a user's browser.
+ *
+ * Route extensions take only the deps they actually use — the [ServerDeps]
+ * bundle is destructured here once at the composition root and never
+ * crosses a route boundary. That keeps every route file independently
+ * testable: you can wire a fake `EngineRegistry` into `healthRoute` without
+ * standing up a `DocumentStore` or a wake-lock callback.
  */
 object ServerEngine {
 
@@ -47,13 +53,27 @@ object ServerEngine {
                 }
             }
             routing {
-                healthRoute(deps)
-                modelsRoute(deps)
-                embeddingsRoute(deps)
-                documentsRoute(deps)
-                aiCoreRoute(deps)
-                benchmarkRoute(deps)
-                chatRoute(deps)
+                healthRoute(deps.engineRegistry)
+                modelsRoute(deps.appContext, deps.embeddingRegistry)
+                embeddingsRoute(deps.appContext, deps.embeddingRegistry, deps.lastActivityAt)
+                documentsRoute(
+                    deps.appContext,
+                    deps.embeddingRegistry,
+                    deps.documentStore,
+                    deps.lastActivityAt,
+                )
+                aiCoreRoute(deps.appContext)
+                benchmarkRoute(deps.appContext, deps.lastActivityAt)
+                chatRoute(
+                    appContext = deps.appContext,
+                    engineRegistry = deps.engineRegistry,
+                    sessionManager = deps.sessionManager,
+                    rateLimiter = deps.rateLimiter,
+                    inferenceMutex = deps.inferenceMutex,
+                    serviceScope = deps.serviceScope,
+                    lastActivityAt = deps.lastActivityAt,
+                    acquireWakeLock = deps.acquireWakeLock,
+                )
             }
         }
 }
