@@ -58,7 +58,16 @@ object ServerEngine {
                 )
                 aiCoreRoute(deps.appContext)
                 benchmarkRoute(deps.appContext, deps.lastActivityAt)
-                chatRoute(deps)
+                chatRoute(
+                    appContext = deps.appContext,
+                    engineRegistry = deps.engineRegistry,
+                    sessionManager = deps.sessionManager,
+                    rateLimiter = deps.rateLimiter,
+                    inferenceMutex = deps.inferenceMutex,
+                    serviceScope = deps.serviceScope,
+                    lastActivityAt = deps.lastActivityAt,
+                    acquireWakeLock = deps.acquireWakeLock,
+                )
             }
         }
 }

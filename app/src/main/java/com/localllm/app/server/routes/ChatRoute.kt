@@ -1,5 +1,6 @@
 package com.localllm.app.server.routes
 
+import android.content.Context
 import com.google.ai.edge.litertlm.Message as LlmMessage
 import com.google.ai.edge.litertlm.ToolCall
 import com.google.gson.Gson
@@ -11,6 +12,7 @@ import com.localllm.app.ErrorDetails
 import com.localllm.app.ErrorResponse
 import com.localllm.app.LogManager
 import com.localllm.app.Message
+import com.localllm.app.RateLimiter
 import com.localllm.app.RequestTracker
 import com.localllm.app.RichErrorDetails
 import com.localllm.app.RichErrorResponse
@@ -27,7 +29,6 @@ import com.localllm.app.inference.EngineRegistry
 import com.localllm.app.inference.aicore.AICoreEngine
 import com.localllm.app.inference.litert.LlmMessageConverter
 import com.localllm.app.inference.litert.SessionManager
-import com.localllm.app.server.ServerDeps
 import com.localllm.app.server.auth.authorize
 import com.localllm.app.stringContent
 import com.localllm.app.textChars
@@ -43,6 +44,8 @@ import io.ktor.server.routing.Route
 import io.ktor.server.routing.post
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.writeStringUtf8
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
@@ -70,19 +73,28 @@ import kotlinx.coroutines.withTimeout
  * If `req.model` is absent or empty, the handler falls back to the
  * persisted [Settings.selectedModelId] (which defaults to AICore).
  */
-fun Route.chatRoute(deps: ServerDeps) {
+fun Route.chatRoute(
+    appContext: Context,
+    engineRegistry: EngineRegistry,
+    sessionManager: SessionManager,
+    rateLimiter: RateLimiter,
+    inferenceMutex: Mutex,
+    serviceScope: CoroutineScope,
+    lastActivityAt: AtomicLong,
+    acquireWakeLock: suspend (timeoutMs: Long, block: suspend () -> Unit) -> Unit,
+) {
     val gson = Gson()
     post("/v1/chat/completions") {
-        if (!authorize(call, deps.appContext)) return@post
-        deps.lastActivityAt.set(System.currentTimeMillis())
+        if (!authorize(call, appContext)) return@post
+        lastActivityAt.set(System.currentTimeMillis())
 
         // Per-client rate limit, keyed on User-Agent. rate=0 disables.
         val clientId = call.request.headers["User-Agent"]?.takeIf { it.isNotBlank() } ?: "anonymous"
-        val rate = Settings.rateLimitPerSec(deps.appContext)
+        val rate = Settings.rateLimitPerSec(appContext)
         if (rate > 0.0) {
-            deps.rateLimiter.ratePerSec = rate
-            deps.rateLimiter.burst = Settings.rateLimitBurst(deps.appContext)
-            val retryAfter = deps.rateLimiter.tryAcquire(clientId)
+            rateLimiter.ratePerSec = rate
+            rateLimiter.burst = Settings.rateLimitBurst(appContext)
+            val retryAfter = rateLimiter.tryAcquire(clientId)
             if (retryAfter != null) {
                 call.response.header("Retry-After", retryAfter.toString())
                 call.response.header("X-RateLimit-Client", clientId)
@@ -99,7 +111,7 @@ fun Route.chatRoute(deps: ServerDeps) {
         }
 
         // Body-size guard. ~2 bytes per char covers JSON overhead with margin.
-        val maxChars = Settings.maxPromptChars(deps.appContext)
+        val maxChars = Settings.maxPromptChars(appContext)
         val bodyCap = maxChars.toLong() * 2L + 8_192L
         val contentLength = call.request.headers["Content-Length"]?.toLongOrNull()
         if (contentLength != null && contentLength > bodyCap) {
@@ -135,7 +147,7 @@ fun Route.chatRoute(deps: ServerDeps) {
         // used to pick the first downloaded `.litertlm`; that selection now
         // belongs to the user (via Settings) and is explicit.
         val req = if (rawReq.model.isBlank()) {
-            rawReq.copy(model = Settings.selectedModelId(deps.appContext))
+            rawReq.copy(model = Settings.selectedModelId(appContext))
         } else rawReq
 
         val promptChars = req.messages.sumOf { it.textChars() }
@@ -151,7 +163,7 @@ fun Route.chatRoute(deps: ServerDeps) {
             return@post
         }
 
-        val maxDepth = Settings.maxQueueDepth(deps.appContext)
+        val maxDepth = Settings.maxQueueDepth(appContext)
         val entry = RequestTracker.tryEnqueue(
             model = req.model,
             stream = req.stream,
@@ -185,7 +197,7 @@ fun Route.chatRoute(deps: ServerDeps) {
 
         val remoteIp = call.request.local.remoteHost
         val ua = clientId
-        val timeoutMs = Settings.requestTimeoutMs(deps.appContext)
+        val timeoutMs = Settings.requestTimeoutMs(appContext)
 
         var resolved: SessionManager.Resolved? = null
         var inferenceOk = false
@@ -197,11 +209,11 @@ fun Route.chatRoute(deps: ServerDeps) {
             )
 
             val responseId = "chatcmpl-${entry.id}"
-            val temp = req.temperature ?: Settings.temperature(deps.appContext)
-            val topK = req.topK ?: Settings.topK(deps.appContext)
+            val temp = req.temperature ?: Settings.temperature(appContext)
+            val topK = req.topK ?: Settings.topK(appContext)
 
             val acquired = try {
-                deps.engineRegistry.acquire(req.model, req.maxTokens)
+                engineRegistry.acquire(req.model, req.maxTokens)
             } catch (e: Throwable) {
                 LogManager.e("ChatRoute", "Engine acquire failed for ${req.model}", e)
                 RequestTracker.markCompleted(entry.id, error = "engine_acquire: ${e.message ?: e.javaClass.simpleName}")
@@ -214,7 +226,7 @@ fun Route.chatRoute(deps: ServerDeps) {
                     // AICore preflight — surfaces a structured envelope
                     // before we commit response headers / SSE prelude.
                     try {
-                        deps.engineRegistry.ensureAiCoreReady()
+                        engineRegistry.ensureAiCoreReady()
                     } catch (notReady: AiCoreNotReadyException) {
                         val (httpStatus, details) = aicoreNotReadyEnvelope(notReady.statusCode, notReady.probeError)
                         call.respond(httpStatus, RichErrorResponse(details))
@@ -267,22 +279,22 @@ fun Route.chatRoute(deps: ServerDeps) {
                     }
                     inferenceOk = true
                     RequestTracker.markCompleted(entry.id)
-                    deps.lastActivityAt.set(System.currentTimeMillis())
+                    lastActivityAt.set(System.currentTimeMillis())
                     return@post
                 }
                 is EngineRegistry.AcquiredEngine.LiteRt -> {
-                    val resolvedLocal = deps.sessionManager.resolve(req, acquired, temp, topK)
+                    val resolvedLocal = sessionManager.resolve(req, acquired, temp, topK)
                     resolved = resolvedLocal
-                    val needWakeLock = Settings.keepAwake(deps.appContext)
+                    val needWakeLock = Settings.keepAwake(appContext)
 
                     if (req.stream) {
                         call.response.cacheControl(CacheControl.NoCache(null))
                         call.respondBytesWriter(contentType = ContentType.Text.EventStream) {
                             streamWriter = this@respondBytesWriter
                             withTimeout(timeoutMs) {
-                                deps.inferenceMutex.withLock {
+                                inferenceMutex.withLock {
                                     RequestTracker.markStarted(entry.id)
-                                    deps.acquireWakeLock(timeoutMs) {
+                                    acquireWakeLock(timeoutMs) {
                                         runInferenceStreaming(
                                             conversation = resolvedLocal.conversation,
                                             prompt = resolvedLocal.prompt,
@@ -291,7 +303,7 @@ fun Route.chatRoute(deps: ServerDeps) {
                                             requestEntryId = entry.id,
                                             modelName = req.model,
                                             gson = gson,
-                                            deps = deps,
+                                            serviceScope = serviceScope,
                                             onChunk = { chunk -> RequestTracker.recordChunk(entry.id, chunk) },
                                         )
                                     }
@@ -300,10 +312,10 @@ fun Route.chatRoute(deps: ServerDeps) {
                         }
                     } else {
                         val finalMsg = withTimeout(timeoutMs) {
-                            deps.inferenceMutex.withLock {
+                            inferenceMutex.withLock {
                                 RequestTracker.markStarted(entry.id)
                                 var result: LlmMessage? = null
-                                deps.acquireWakeLock(timeoutMs) {
+                                acquireWakeLock(timeoutMs) {
                                     result = withContext(Dispatchers.Default) {
                                         resolvedLocal.conversation.sendMessage(resolvedLocal.prompt, emptyMap())
                                     }
@@ -351,7 +363,7 @@ fun Route.chatRoute(deps: ServerDeps) {
                     }
                     inferenceOk = true
                     RequestTracker.markCompleted(entry.id)
-                    deps.lastActivityAt.set(System.currentTimeMillis())
+                    lastActivityAt.set(System.currentTimeMillis())
                 }
             }
         } catch (te: TimeoutCancellationException) {
@@ -403,10 +415,10 @@ fun Route.chatRoute(deps: ServerDeps) {
             val r = resolved
             if (r != null) {
                 if (r.isCached) {
-                    if (inferenceOk) deps.sessionManager.commit(r, req.messages)
-                    else deps.sessionManager.invalidate(r)
+                    if (inferenceOk) sessionManager.commit(r, req.messages)
+                    else sessionManager.invalidate(r)
                 } else {
-                    deps.sessionManager.closeIfStateless(r)
+                    sessionManager.closeIfStateless(r)
                 }
             }
         }
@@ -504,7 +516,7 @@ private suspend fun runInferenceStreaming(
     requestEntryId: String,
     modelName: String,
     gson: Gson,
-    deps: ServerDeps,
+    serviceScope: CoroutineScope,
     onChunk: (String) -> Unit = {},
 ) {
     val writeMutex = Mutex()
@@ -514,7 +526,7 @@ private suspend fun runInferenceStreaming(
             writer.flush()
         }
     }
-    val heartbeat = deps.serviceScope.launch {
+    val heartbeat = serviceScope.launch {
         while (isActive) {
             delay(10_000L)
             try { safeWrite(": ka\n\n") } catch (_: Throwable) { return@launch }
