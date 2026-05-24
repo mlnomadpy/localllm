@@ -47,7 +47,7 @@ object ServerEngine {
                 }
             }
             routing {
-                healthRoute(deps)
+                healthRoute(deps.engineRegistry)
                 modelsRoute(deps)
                 embeddingsRoute(deps)
                 documentsRoute(deps)

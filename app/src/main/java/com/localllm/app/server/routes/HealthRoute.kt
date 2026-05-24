@@ -1,8 +1,8 @@
 package com.localllm.app.server.routes
 
 import com.localllm.app.RequestTracker
+import com.localllm.app.inference.EngineRegistry
 import com.localllm.app.inference.aicore.AICoreEngine
-import com.localllm.app.server.ServerDeps
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
@@ -13,7 +13,7 @@ import io.ktor.server.routing.get
  * cached LiteRT engines, and the live AICore (Gemini Nano) status so a
  * client can tell at a glance whether the default model is usable.
  */
-fun Route.healthRoute(deps: ServerDeps) {
+fun Route.healthRoute(engineRegistry: EngineRegistry) {
     get("/health") {
         // Probe AICore inline. `checkStatusCode()` is suspend; we swallow
         // throws because the SDK throwing (typically ErrorCode -101) is the
@@ -42,8 +42,8 @@ fun Route.healthRoute(deps: ServerDeps) {
             "service" to "localllm-android",
             "version" to "1.0",
             "queue_depth" to RequestTracker.queue.value.size,
-            "engines_loaded" to deps.engineRegistry.engineCount(),
-            "engines" to deps.engineRegistry.snapshot().map { e ->
+            "engines_loaded" to engineRegistry.engineCount(),
+            "engines" to engineRegistry.snapshot().map { e ->
                 mapOf(
                     "key" to e.cacheKey,
                     "backend" to e.backend,
