@@ -118,15 +118,11 @@ fun ChatTab(
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
 
-    if (existingModels.isEmpty()) {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text(
-                stringResource(R.string.chat_needs_model),
-                color = MaterialTheme.colorScheme.error,
-            )
-        }
-        return
-    }
+    // No early-return on `existingModels.isEmpty()` anymore — AICore (Gemini
+    // Nano) is the default model and has no file on disk, so a fresh install
+    // with zero `.litertlm` files is a perfectly valid chat state. Failures
+    // (e.g. AICore not provisioned on this device) surface via the structured
+    // error envelope on the actual send.
 
     // System-prompt state. Sheet is opened either by tapping the inline
     // indicator strip's edit icon, or by the Tune action in the app bar via
