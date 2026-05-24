@@ -96,7 +96,13 @@ class MainActivity : ComponentActivity() {
             var chatInput by remember { mutableStateOf("") }
             var isChatting by remember { mutableStateOf(false) }
             val chatListState = rememberLazyListState()
-            var selectedModel by remember { mutableStateOf("") }
+            // Source of truth for the chat-tab model is the user's persisted
+            // "Default" choice in the Models tab. The local override below lets
+            // the user pick a different model inline (chat-tab selector chip)
+            // without overwriting the persisted default.
+            val persistedDefault by SettingsRepository.get(context).selectedModelId.collectAsState()
+            var selectedModelOverride by remember { mutableStateOf<String?>(null) }
+            val selectedModel: String = selectedModelOverride ?: persistedDefault
             var chatJob by remember { mutableStateOf<Job?>(null) }
             var chatTokenRate by remember { mutableStateOf(0.0) }
             var chatTokenCount by remember { mutableStateOf(0) }
@@ -110,9 +116,15 @@ class MainActivity : ComponentActivity() {
 
             var customUrls by remember { mutableStateOf(Settings.customModelUrls(context)) }
 
-            LaunchedEffect(existingModels) {
-                if (selectedModel.isEmpty() && existingModels.isNotEmpty()) {
-                    selectedModel = existingModels.first().removeSuffix(".litertlm")
+            // One-time seed: if the user has never picked a default and we
+            // discover a downloaded .litertlm on disk, promote the first one
+            // to the persisted default. AICore is the factory default before
+            // any download; once any .litertlm shows up we'd rather not silently
+            // route requests to AICore (which may be unavailable on the device).
+            LaunchedEffect(existingModels, persistedDefault) {
+                if (persistedDefault == Settings.DEFAULT_MODEL_ID && existingModels.isNotEmpty()) {
+                    val first = existingModels.first().removeSuffix(".litertlm")
+                    Settings.setSelectedModelId(context, first)
                 }
             }
 
@@ -265,7 +277,11 @@ class MainActivity : ComponentActivity() {
                                 AppTab.CHAT -> ChatTab(
                                     existingModels = existingModels,
                                     selectedModel = selectedModel,
-                                    onModelChange = { selectedModel = it },
+                                    // Inline chat-tab change is a transient
+                                    // override; tapping a row's "Set as
+                                    // default" in the Models tab clears it
+                                    // (override → null → fall back to flow).
+                                    onModelChange = { selectedModelOverride = it },
                                     chatMessages = chatMessages,
                                     chatInput = chatInput,
                                     onInputChange = { chatInput = it },

@@ -26,7 +26,6 @@ import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.DownloadForOffline
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Info
-import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material.icons.outlined.Verified
 import androidx.compose.material.icons.outlined.WarningAmber
@@ -43,6 +42,7 @@ import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -62,10 +62,13 @@ import androidx.compose.material.icons.outlined.Memory
 import com.localllm.app.AVAILABLE_MODELS
 import com.localllm.app.Backend
 import com.localllm.app.ModelInfo
+import com.localllm.app.Settings
+import com.localllm.app.SettingsRepository
 import com.localllm.app.inference.aicore.AICoreEngine
 import com.localllm.app.matchesCurrentSoc
 import com.localllm.app.npuSocLabel
 import com.localllm.app.R
+import com.localllm.app.ui.models.DefaultModelRadio
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -87,6 +90,10 @@ fun ModelsTab(
     onImport: () -> Unit
 ) {
     val context = LocalContext.current
+    // Reactive read so a tap on any row's "Set as default" updates the
+    // highlighted row + the AICore card simultaneously, without recompose
+    // ping-pong through MainActivity.
+    val selectedModelId by SettingsRepository.get(context).selectedModelId.collectAsState()
     val customDesc = stringResource(R.string.catalog_custom_description)
     val custom = customUrls.mapNotNull { url ->
         val fname = url.substringAfterLast('/').takeIf { it.endsWith(".litertlm") }
@@ -117,7 +124,14 @@ fun ModelsTab(
         // AICore (Gemini Nano) — the default engine post-pivot. Shown at the
         // top so the live status badge (Ready / Tap to download / Downloading
         // / Not available) is the first thing a user sees on the Models tab.
-        item { AICoreModelCard() }
+        item {
+            AICoreModelCard(
+                isDefault = selectedModelId == Settings.DEFAULT_MODEL_ID,
+                onSetDefault = {
+                    Settings.setSelectedModelId(context, Settings.DEFAULT_MODEL_ID)
+                },
+            )
+        }
 
         item {
             OutlinedButton(
@@ -150,6 +164,12 @@ fun ModelsTab(
                 totalBytes = total,
                 sizeOnDisk = sizeOnDisk,
                 mtime = mtime,
+                isDefault = selectedModelId == model.id,
+                // .litertlm-backed rows can only become the default once the
+                // weights are on disk; otherwise the server would fail to
+                // load the fallback model. AICore is rendered separately.
+                canSetDefault = isDownloaded,
+                onSetDefault = { Settings.setSelectedModelId(context, model.id) },
                 onDownload = { onDownload(model) },
                 onCancel = { onCancel(model) },
                 onDelete = { onDelete(model) },
@@ -212,6 +232,9 @@ private fun ModelCard(
     totalBytes: Long,
     sizeOnDisk: Long,
     mtime: Long,
+    isDefault: Boolean,
+    canSetDefault: Boolean,
+    onSetDefault: () -> Unit,
     onDownload: () -> Unit,
     onCancel: () -> Unit,
     onDelete: () -> Unit,
@@ -227,12 +250,24 @@ private fun ModelCard(
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
-            // Title
-            Text(
-                text = model.name,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold
-            )
+            // Title row — name + a filled "Default" pill when this row is the
+            // current fallback model. The pill mirrors the AICore card so the
+            // visual story across the tab stays consistent.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = model.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                if (isDefault) {
+                    DefaultModelRadio(
+                        isDefault = true,
+                        enabled = true,
+                        onSelect = {},
+                    )
+                }
+            }
 
             // SHA-256 verification badge (only for installed models)
             if (isDownloaded) {
@@ -366,8 +401,18 @@ private fun ModelCard(
             } else {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    // Left: "Set as default" radio (only when not already the
+                    // default — the title-row pill handles that case).
+                    if (!isDefault) {
+                        DefaultModelRadio(
+                            isDefault = false,
+                            enabled = canSetDefault,
+                            onSelect = onSetDefault,
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
                     if (isDownloaded) {
                         OutlinedButton(
                             onClick = onDelete,
@@ -426,7 +471,10 @@ private const val AICORE_PROBE_NOT_INSTALLED = -101
  * eagerly on first composition.
  */
 @Composable
-private fun AICoreModelCard() {
+private fun AICoreModelCard(
+    isDefault: Boolean,
+    onSetDefault: () -> Unit,
+) {
     val scope = rememberCoroutineScope()
     var refreshTick by remember { mutableIntStateOf(0) }
     var provisioning by remember { mutableStateOf(false) }
@@ -471,7 +519,14 @@ private fun AICoreModelCard() {
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.weight(1f),
                 )
-                DefaultBadge()
+                // AICore has no .litertlm file so it's always selectable as
+                // the default; availability is enforced at request time by
+                // the server engine, not here.
+                DefaultModelRadio(
+                    isDefault = isDefault,
+                    enabled = true,
+                    onSelect = onSetDefault,
+                )
             }
 
             Spacer(Modifier.height(4.dp))
@@ -561,33 +616,6 @@ private fun AICoreModelCard() {
                 }
             }
         }
-    }
-}
-
-/** Small green "Default" badge for the AICore card title row. */
-@Composable
-private fun DefaultBadge() {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .background(
-                MaterialTheme.colorScheme.tertiaryContainer,
-                RoundedCornerShape(6.dp)
-            )
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-    ) {
-        Icon(
-            imageVector = Icons.Outlined.Star,
-            contentDescription = null,
-            modifier = Modifier.size(12.dp),
-            tint = MaterialTheme.colorScheme.onTertiaryContainer,
-        )
-        Spacer(Modifier.width(4.dp))
-        Text(
-            text = "Default",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onTertiaryContainer,
-        )
     }
 }
 
