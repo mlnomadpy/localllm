@@ -112,8 +112,8 @@ class SettingsRepository private constructor(context: Context) {
     private val _idleStopMs = MutableStateFlow(Settings.DEFAULT_IDLE_STOP_MS)
     val idleStopMs: StateFlow<Long> = _idleStopMs.asStateFlow()
 
-    private val _backend = MutableStateFlow(Settings.BACKEND_AUTO)
-    val backend: StateFlow<String> = _backend.asStateFlow()
+    private val _selectedModelId = MutableStateFlow(Settings.DEFAULT_MODEL_ID)
+    val selectedModelId: StateFlow<String> = _selectedModelId.asStateFlow()
 
     private val _allowCors = MutableStateFlow(false)
     val allowCors: StateFlow<Boolean> = _allowCors.asStateFlow()
@@ -153,7 +153,7 @@ class SettingsRepository private constructor(context: Context) {
         _keepAwake.value = p[KEY_KEEP_AWAKE] ?: true
         _idleEvictMs.value = p[KEY_IDLE_EVICT_MS] ?: Settings.DEFAULT_IDLE_EVICT_MS
         _idleStopMs.value = p[KEY_IDLE_STOP_MS] ?: Settings.DEFAULT_IDLE_STOP_MS
-        _backend.value = p[KEY_BACKEND] ?: Settings.BACKEND_AUTO
+        _selectedModelId.value = (p[KEY_SELECTED_MODEL_ID]?.takeIf { it.isNotBlank() }) ?: Settings.DEFAULT_MODEL_ID
         _allowCors.value = p[KEY_ALLOW_CORS] ?: false
     }
 
@@ -261,13 +261,10 @@ class SettingsRepository private constructor(context: Context) {
         _idleStopMs.value = safe
     }
 
-    fun setBackend(value: String) {
-        val safe = when (value.uppercase()) {
-            Settings.BACKEND_CPU, Settings.BACKEND_GPU, Settings.BACKEND_AUTO -> value.uppercase()
-            else -> Settings.BACKEND_AUTO
-        }
-        writeBlocking { it[KEY_BACKEND] = safe }
-        _backend.value = safe
+    fun setSelectedModelId(value: String) {
+        val safe = value.trim().ifEmpty { Settings.DEFAULT_MODEL_ID }
+        writeBlocking { it[KEY_SELECTED_MODEL_ID] = safe }
+        _selectedModelId.value = safe
     }
 
     fun setAllowCors(value: Boolean) {
@@ -298,7 +295,7 @@ class SettingsRepository private constructor(context: Context) {
         _keepAwake.value = true
         _idleEvictMs.value = Settings.DEFAULT_IDLE_EVICT_MS
         _idleStopMs.value = Settings.DEFAULT_IDLE_STOP_MS
-        _backend.value = Settings.BACKEND_AUTO
+        _selectedModelId.value = Settings.DEFAULT_MODEL_ID
         _allowCors.value = false
     }
 
@@ -327,7 +324,7 @@ class SettingsRepository private constructor(context: Context) {
         private val KEY_KEEP_AWAKE = booleanPreferencesKey(Settings.KEY_KEEP_AWAKE)
         private val KEY_IDLE_EVICT_MS = longPreferencesKey(Settings.KEY_IDLE_EVICT_MS)
         private val KEY_IDLE_STOP_MS = longPreferencesKey(Settings.KEY_IDLE_STOP_MS)
-        private val KEY_BACKEND = stringPreferencesKey(Settings.KEY_BACKEND)
+        private val KEY_SELECTED_MODEL_ID = stringPreferencesKey(Settings.KEY_SELECTED_MODEL_ID)
         private val KEY_ALLOW_CORS = booleanPreferencesKey(Settings.KEY_ALLOW_CORS)
 
         /**

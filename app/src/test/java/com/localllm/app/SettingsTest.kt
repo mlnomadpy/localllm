@@ -52,31 +52,30 @@ class SettingsTest {
         assertEquals(65535, Settings.port(context))
     }
 
-    /* ---------- backend ---------- */
+    /* ---------- selected model ---------- */
 
     @Test
-    fun `default backend is AUTO`() {
-        assertEquals(Settings.BACKEND_AUTO, Settings.backend(context))
+    fun `default selected model is AICore Gemini Nano`() {
+        assertEquals("gemini-nano-aicore", Settings.selectedModelId(context))
+        assertEquals(Settings.DEFAULT_MODEL_ID, Settings.selectedModelId(context))
     }
 
     @Test
-    fun `setBackend accepts valid values`() {
-        Settings.setBackend(context, "GPU")
-        assertEquals("GPU", Settings.backend(context))
-        Settings.setBackend(context, "CPU")
-        assertEquals("CPU", Settings.backend(context))
+    fun `setSelectedModelId persists the value`() {
+        Settings.setSelectedModelId(context, "gemma-4-e2b")
+        assertEquals("gemma-4-e2b", Settings.selectedModelId(context))
     }
 
     @Test
-    fun `setBackend normalizes case`() {
-        Settings.setBackend(context, "gpu")
-        assertEquals("GPU", Settings.backend(context))
+    fun `setSelectedModelId trims whitespace`() {
+        Settings.setSelectedModelId(context, "  gemma-4-e4b  ")
+        assertEquals("gemma-4-e4b", Settings.selectedModelId(context))
     }
 
     @Test
-    fun `setBackend falls back to AUTO on garbage`() {
-        Settings.setBackend(context, "QUANTUM")
-        assertEquals(Settings.BACKEND_AUTO, Settings.backend(context))
+    fun `setSelectedModelId empty falls back to default`() {
+        Settings.setSelectedModelId(context, "")
+        assertEquals(Settings.DEFAULT_MODEL_ID, Settings.selectedModelId(context))
     }
 
     /* ---------- bindHost ---------- */

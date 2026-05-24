@@ -3,6 +3,24 @@ package com.localllm.app
 import android.os.Build
 
 /**
+ * Which inference engine + delegate this model expects. Declared per-model
+ * in the catalog so the server no longer has to guess from a global setting
+ * or fall back through a chain of attempts — the catalog is the source of
+ * truth and the engine layer either honors it or fails loudly.
+ *
+ * - [AICORE]      → Google's on-device Gemini Nano via ML Kit GenAI. No
+ *                   `.litertlm` file; backend selection is owned by the
+ *                   system service.
+ * - [LITERT_CPU]  → LiteRT-LM with `Backend.CPU()`. The portable default
+ *                   for `.litertlm` files compiled for the CPU path.
+ * - [LITERT_GPU]  → LiteRT-LM with `Backend.GPU()`. Strict — no fallback;
+ *                   only meaningful for models compiled with GPU ops.
+ * - [LITERT_NPU]  → LiteRT-LM with `Backend.NPU(nativeLibraryDir)`. Requires
+ *                   the vendor delegate `.so` to be present.
+ */
+enum class Backend { AICORE, LITERT_CPU, LITERT_GPU, LITERT_NPU }
+
+/**
  * Metadata for a downloadable / importable model bundle. Used both by the
  * Catalog tab (built-in entries) and to render user-added URLs as catalog rows.
  */
@@ -12,6 +30,12 @@ data class ModelInfo(
     val description: String,
     val url: String,
     val filename: String,
+    /**
+     * The engine + delegate this model must run on. No default — every entry
+     * in [AVAILABLE_MODELS] must declare it explicitly so an accidental omission
+     * surfaces at compile time.
+     */
+    val backend: Backend,
     /**
      * Lowercase hex SHA-256 of the file at [url], if known. The download flow
      * verifies it post-completion and deletes the file on mismatch. `null`
@@ -23,9 +47,8 @@ data class ModelInfo(
      * Lowercase SoC marker required by an NPU-compiled `.litertlm`
      * (`sm8750`, `mt6989`, …). Null for CPU/GPU-portable models. When set,
      * the model only runs end-to-end on a device whose
-     * [Build.SOC_MODEL] contains this marker AND has a vendor NPU delegate
-     * (QAIRT for Qualcomm, NeuroPilot for MediaTek) reachable via
-     * `nativeLibraryDir` — see [Settings.hasNpuDelegate].
+     * [Build.SOC_MODEL] contains this marker. Used for catalog filtering;
+     * does NOT drive backend selection — see [Backend].
      */
     val requiredSocMarker: String? = null,
     /**
@@ -80,12 +103,28 @@ private const val NPU_REPO = "https://huggingface.co/litert-community/Gemma3-1B-
  * at render time.
  */
 val AVAILABLE_MODELS: List<ModelInfo> = listOf(
+    /* ---- AICore (Gemini Nano) — the default ----
+     * Virtual entry — no download, no `.litertlm` file. Availability is
+     * gated by the AICore system service on the device (Pixel 8+) and the
+     * model-download state surfaced by `GenerativeModel.checkStatus()`.
+     * The Models tab still lists it so users can see whether it's usable
+     * on their device; `/v1/models` advertises it unconditionally.
+     */
+    ModelInfo(
+        id = "gemini-nano-aicore",
+        name = "Gemini Nano (AICore)",
+        description = "Google's on-device Gemini Nano routed through ML Kit GenAI / AICore. No download, no engine — the system service owns the weights and picks the backend (NPU/GPU/CPU) automatically. Pixel 8+; the first call after install may require AICore to download the model in the background.",
+        url = "",
+        filename = "",
+        backend = Backend.AICORE,
+    ),
     ModelInfo(
         id = "gemma-4-e2b",
         name = "Gemma 4 E2B IT",
-        description = "Instruction tuned, multimodal-ready Gemma 4 in LiteRT-LM format (CPU / GPU). ~2.6 GB. Fastest of the two.",
+        description = "Instruction tuned, multimodal-ready Gemma 4 in LiteRT-LM format (CPU). ~2.6 GB. Fastest of the two.",
         url = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm",
         filename = "gemma-4-e2b.litertlm",
+        backend = Backend.LITERT_CPU,
         // SHA-256 verified locally against the actual downloaded artifact;
         // matches HF's xet-backed `x-linked-etag` header.
         sha256 = "181938105e0eefd105961417e8da75903eacda102c4fce9ce90f50b97139a63c"
@@ -96,6 +135,7 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         description = "Larger Gemma 4 — more accurate, slower. LiteRT-LM format, ~4 GB.",
         url = "https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/main/gemma-4-E4B-it.litertlm",
         filename = "gemma-4-e4b.litertlm",
+        backend = Backend.LITERT_CPU,
         // SHA-256 sourced from HF's `x-linked-etag` (same pattern as E2B,
         // empirically confirmed to be SHA-256 for these xet-backed files).
         sha256 = "0b2a8980ce155fd97673d8e820b4d29d9c7d99b8fa6806f425d969b145bd52e0"
@@ -124,6 +164,7 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         description = "NPU-compiled Gemma 3 1B for Snapdragon 8 Gen 2. ~690 MB. Requires QAIRT runtime + ADSP_LIBRARY_PATH.",
         url = "$NPU_REPO/Gemma3-1B-IT_q4_ekv1280_sm8550.litertlm",
         filename = "gemma3-1b-it-npu-sm8550.litertlm",
+        backend = Backend.LITERT_NPU,
         requiredSocMarker = "sm8550",
     ),
     ModelInfo(
@@ -132,6 +173,7 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         description = "NPU-compiled Gemma 3 1B for Snapdragon 8 Gen 3. ~690 MB. Requires QAIRT runtime + ADSP_LIBRARY_PATH.",
         url = "$NPU_REPO/Gemma3-1B-IT_q4_ekv1280_sm8650.litertlm",
         filename = "gemma3-1b-it-npu-sm8650.litertlm",
+        backend = Backend.LITERT_NPU,
         requiredSocMarker = "sm8650",
     ),
     ModelInfo(
@@ -140,6 +182,7 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         description = "NPU-compiled Gemma 3 1B for Snapdragon 8 Elite (S25). ~689 MB. Requires QAIRT runtime + ADSP_LIBRARY_PATH.",
         url = "$NPU_REPO/Gemma3-1B-IT_q4_ekv1280_sm8750.litertlm",
         filename = "gemma3-1b-it-npu-sm8750.litertlm",
+        backend = Backend.LITERT_NPU,
         requiredSocMarker = "sm8750",
     ),
     ModelInfo(
@@ -148,6 +191,7 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         description = "NPU-compiled Gemma 3 1B for Snapdragon 8 Elite Gen 5. ~694 MB. Requires QAIRT runtime + ADSP_LIBRARY_PATH.",
         url = "$NPU_REPO/Gemma3-1B-IT_q4_ekv1280_sm8850.litertlm",
         filename = "gemma3-1b-it-npu-sm8850.litertlm",
+        backend = Backend.LITERT_NPU,
         requiredSocMarker = "sm8850",
     ),
     ModelInfo(
@@ -156,6 +200,7 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         description = "NPU-compiled Gemma 3 1B for MediaTek Dimensity 9300. ~1.03 GB. Requires NeuroPilot runtime.",
         url = "$NPU_REPO/Gemma3-1B-IT_q4_ekv1280_mt6989.litertlm",
         filename = "gemma3-1b-it-npu-mt6989.litertlm",
+        backend = Backend.LITERT_NPU,
         requiredSocMarker = "mt6989",
     ),
     ModelInfo(
@@ -164,6 +209,7 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         description = "NPU-compiled Gemma 3 1B for MediaTek Dimensity 9400. ~1.03 GB. Requires NeuroPilot runtime.",
         url = "$NPU_REPO/Gemma3-1B-IT_q4_ekv1280_mt6991.litertlm",
         filename = "gemma3-1b-it-npu-mt6991.litertlm",
+        backend = Backend.LITERT_NPU,
         requiredSocMarker = "mt6991",
     ),
     ModelInfo(
@@ -172,6 +218,7 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         description = "NPU-compiled Gemma 3 1B for MediaTek Dimensity 9500. ~1.02 GB. Requires NeuroPilot runtime.",
         url = "$NPU_REPO/Gemma3-1B-IT_q4_ekv1280_mt6993.litertlm",
         filename = "gemma3-1b-it-npu-mt6993.litertlm",
+        backend = Backend.LITERT_NPU,
         requiredSocMarker = "mt6993",
     ),
     ModelInfo(
@@ -186,6 +233,7 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         description = "NPU-compiled Gemma 3 1B for Google Tensor G5 (Pixel 10). ~1.68 GB (q8 quantization — larger than the q4 Qualcomm/MediaTek variants). Runs on the Tensor TPU via bundled dispatch lib — no extra runtime install.",
         url = "$NPU_REPO/Gemma3-1B-IT_q8_ekv1280_Google_Tensor_G5.litertlm",
         filename = "gemma3-1b-it-npu-tensor-g5.litertlm",
+        backend = Backend.LITERT_NPU,
         // Pixel 10's Tensor G5 reports SoC codename "LAGUNA" via
         // ro.soc.model — not "Tensor G5". Verified on a Frankel device.
         requiredSocMarker = "laguna",
@@ -206,3 +254,10 @@ val AVAILABLE_MODELS: List<ModelInfo> = listOf(
         isVirtual = true,
     ),
 )
+
+/**
+ * Find a catalog entry by its `id` field. Returns null when the id doesn't
+ * match a built-in entry — callers can then treat it as a side-loaded
+ * `.litertlm` and default to [Backend.LITERT_CPU].
+ */
+fun findModelInfo(id: String): ModelInfo? = AVAILABLE_MODELS.firstOrNull { it.id == id }

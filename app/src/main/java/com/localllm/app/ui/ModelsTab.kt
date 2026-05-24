@@ -44,6 +44,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.background
 import androidx.compose.material.icons.outlined.Memory
 import com.localllm.app.AVAILABLE_MODELS
+import com.localllm.app.Backend
 import com.localllm.app.ModelInfo
 import com.localllm.app.matchesCurrentSoc
 import com.localllm.app.npuSocLabel
@@ -75,7 +76,11 @@ fun ModelsTab(
             name = bare,
             description = customDesc,
             url = url,
-            filename = fname
+            filename = fname,
+            // Custom URLs are assumed to be portable CPU LiteRT-LM bundles —
+            // we have no way to know otherwise. Catalog-declared NPU/GPU
+            // models live in AVAILABLE_MODELS, not here.
+            backend = Backend.LITERT_CPU,
         )
     }
     val all = builtIn + custom
