@@ -46,6 +46,7 @@ import androidx.compose.material.icons.outlined.Memory
 import com.localllm.app.AVAILABLE_MODELS
 import com.localllm.app.Backend
 import com.localllm.app.ModelInfo
+import com.localllm.app.isVirtual
 import com.localllm.app.matchesCurrentSoc
 import com.localllm.app.npuSocLabel
 import com.localllm.app.R
