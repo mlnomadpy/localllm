@@ -233,35 +233,42 @@ fun Route.chatRoute(
                         RequestTracker.markCompleted(entry.id, error = "aicore_${details.code}")
                         return@post
                     }
-                    val flatPrompt = flattenForAICore(req.messages)
+                    val flat = flattenForAICore(req.messages)
                     if (req.stream) {
                         call.response.cacheControl(CacheControl.NoCache(null))
                         call.respondBytesWriter(contentType = ContentType.Text.EventStream) {
                             streamWriter = this@respondBytesWriter
                             withTimeout(timeoutMs) {
                                 RequestTracker.markStarted(entry.id)
-                                runAICoreStreaming(
-                                    writer = this@respondBytesWriter,
-                                    prompt = flatPrompt,
-                                    temperature = temp,
-                                    topK = topK,
-                                    maxOutputTokens = req.maxTokens,
-                                    responseId = responseId,
-                                    modelName = req.model,
-                                    requestEntryId = entry.id,
-                                    gson = gson,
-                                    onChunk = { delta -> RequestTracker.recordChunk(entry.id, delta) },
-                                )
+                                val acc = RequestTracker.accumulatorFor(entry.id)
+                                try {
+                                    runAICoreStreaming(
+                                        writer = this@respondBytesWriter,
+                                        prompt = flat.text,
+                                        image = flat.image,
+                                        temperature = temp,
+                                        topK = topK,
+                                        maxOutputTokens = req.maxTokens,
+                                        responseId = responseId,
+                                        modelName = req.model,
+                                        requestEntryId = entry.id,
+                                        gson = gson,
+                                        onChunk = { delta -> acc.add(delta.length) },
+                                    )
+                                } finally {
+                                    acc.flush()
+                                }
                             }
                         }
                     } else {
                         val text = withTimeout(timeoutMs) {
                             RequestTracker.markStarted(entry.id)
                             AICoreEngine.complete(
-                                prompt = flatPrompt,
+                                prompt = flat.text,
                                 temperature = temp,
                                 topK = topK,
                                 maxOutputTokens = req.maxTokens,
+                                image = flat.image,
                             )
                         }
                         RequestTracker.recordChunk(entry.id, text)
@@ -294,18 +301,23 @@ fun Route.chatRoute(
                             withTimeout(timeoutMs) {
                                 inferenceMutex.withLock {
                                     RequestTracker.markStarted(entry.id)
+                                    val acc = RequestTracker.accumulatorFor(entry.id)
                                     acquireWakeLock(timeoutMs) {
-                                        runInferenceStreaming(
-                                            conversation = resolvedLocal.conversation,
-                                            prompt = resolvedLocal.prompt,
-                                            writer = this@respondBytesWriter,
-                                            responseId = responseId,
-                                            requestEntryId = entry.id,
-                                            modelName = req.model,
-                                            gson = gson,
-                                            serviceScope = serviceScope,
-                                            onChunk = { chunk -> RequestTracker.recordChunk(entry.id, chunk) },
-                                        )
+                                        try {
+                                            runInferenceStreaming(
+                                                conversation = resolvedLocal.conversation,
+                                                prompt = resolvedLocal.prompt,
+                                                writer = this@respondBytesWriter,
+                                                responseId = responseId,
+                                                requestEntryId = entry.id,
+                                                modelName = req.model,
+                                                gson = gson,
+                                                serviceScope = serviceScope,
+                                                onChunk = { chunk -> acc.add(chunk.length) },
+                                            )
+                                        } finally {
+                                            acc.flush()
+                                        }
                                     }
                                 }
                             }
@@ -426,32 +438,63 @@ fun Route.chatRoute(
 }
 
 /**
- * Flatten an OpenAI chat-history into a single string prompt for AICore.
- * AICore's `GenerateContentRequest` takes a `TextPart(string)` only; there
- * is no first-class system / role slot.
+ * Flatten an OpenAI chat-history into the AICore wire shape: a single text
+ * prompt plus (optionally) the first attached image's raw bytes.
+ *
+ * AICore's `GenerateContentRequest` accepts at most one image part per
+ * request, so this picks the last image_url across the conversation
+ * (matching the "most recent attachment is what the user is asking about"
+ * heuristic that visual-question-answering clients use).
+ *
+ * Image fetch policy mirrors the LiteRT path: `data:` URLs decode inline;
+ * `http://localhost...` is fetched via OkHttp; anything else is rejected
+ * (SSRF protection). Bytes are downscaled to ≤1024px JPEG if needed —
+ * AICore-side processing is faster on small inputs.
  */
-private fun flattenForAICore(messages: List<Message>): String {
+internal data class FlattenedAICorePrompt(
+    val text: String,
+    val image: ByteArray?,
+)
+
+private fun flattenForAICore(messages: List<Message>): FlattenedAICorePrompt {
     val sb = StringBuilder()
+    var lastImageUrl: String? = null
     for (m in messages) {
-        val text = m.contentString() ?: m.contentParts()
-            .filterIsInstance<ContentPart.TextPart>()
+        val parts = if (m.contentString() != null) {
+            listOf(ContentPart.TextPart(m.contentString()!!))
+        } else m.contentParts()
+        val text = parts.filterIsInstance<ContentPart.TextPart>()
             .joinToString(" ") { it.text }
-        if (text.isBlank()) continue
+        parts.filterIsInstance<ContentPart.ImagePart>().lastOrNull()?.let { lastImageUrl = it.url }
+        if (text.isBlank() && lastImageUrl == null) continue
         val label = when (m.role) {
             "system" -> "system"
             "assistant" -> "assistant"
             "tool" -> "tool"
             else -> "user"
         }
-        sb.append(label).append(": ").append(text).append("\n\n")
+        if (text.isNotBlank()) sb.append(label).append(": ").append(text).append("\n\n")
     }
     sb.append("assistant: ")
-    return sb.toString()
+
+    val imageBytes = lastImageUrl?.let { url ->
+        try {
+            com.localllm.app.inference.litert.LlmMessageConverter.loadImageBytesForAICore(url)
+        } catch (e: Exception) {
+            com.localllm.app.LogManager.w(
+                "ChatRoute",
+                "Failed to load image_url for AICore: ${e.message ?: e.javaClass.simpleName}",
+            )
+            null
+        }
+    }
+    return FlattenedAICorePrompt(sb.toString(), imageBytes)
 }
 
 private suspend fun runAICoreStreaming(
     writer: ByteWriteChannel,
     prompt: String,
+    image: ByteArray?,
     temperature: Float?,
     topK: Int?,
     maxOutputTokens: Int?,
@@ -473,20 +516,24 @@ private suspend fun runAICoreStreaming(
     )
     safeWrite("data: ${gson.toJson(initResp)}\n\n")
 
-    var prev = ""
+    // AICore streams cumulative text. Track only the length we've already
+    // forwarded — drops the O(prev.length) startsWith compare that the old
+    // path ran per token. If the engine ever shortens or rewrites the
+    // running text (rare; not part of the documented contract), we restart
+    // the delta calculation from the new shorter prefix.
+    var prevLen = 0
     AICoreEngine.stream(
         prompt = prompt,
         temperature = temperature,
         topK = topK,
         maxOutputTokens = maxOutputTokens,
+        image = image,
     ).collect { full ->
-        val delta = when {
-            full.startsWith(prev) && full.length > prev.length -> full.substring(prev.length)
-            full == prev -> ""
-            else -> full
-        }
+        val len = full.length
+        if (len == prevLen) return@collect
+        val delta = if (len > prevLen) full.substring(prevLen) else full
+        prevLen = len
         if (delta.isEmpty()) return@collect
-        prev = if (full.startsWith(prev)) full else prev + delta
         onChunk(delta)
         val chunkResp = StreamResponse(
             id = responseId,
@@ -542,17 +589,18 @@ private suspend fun runInferenceStreaming(
         )
         safeWrite("data: ${gson.toJson(initResp)}\n\n")
 
-        var prev = ""
+        // Length-tracked delta — see runAICoreStreaming() for the rationale.
+        var prevLen = 0
         var lastToolCalls: List<ToolCall>? = null
         conversation.sendMessageAsync(prompt, emptyMap()).collect { msg ->
             msg.toolCalls?.takeIf { it.isNotEmpty() }?.let { lastToolCalls = it }
 
             val full = LlmMessageConverter.messageText(msg)
-            val delta = if (full.startsWith(prev) && full.length > prev.length) full.substring(prev.length)
-                        else if (full == prev) ""
-                        else full
+            val len = full.length
+            if (len == prevLen) return@collect
+            val delta = if (len > prevLen) full.substring(prevLen) else full
+            prevLen = len
             if (delta.isNotEmpty()) {
-                prev = if (full.startsWith(prev)) full else prev + delta
                 onChunk(delta)
                 val chunkResp = StreamResponse(
                     id = responseId,

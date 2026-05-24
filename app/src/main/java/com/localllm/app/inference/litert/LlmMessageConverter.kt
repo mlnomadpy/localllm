@@ -142,6 +142,14 @@ object LlmMessageConverter {
         return engine.createConversation(cfg)
     }
 
+    /**
+     * Public alias for [loadImageBytes] — used by the AICore branch of the
+     * chat route so it can reuse the SSRF policy + downscale logic without
+     * duplicating it. Same contract: throws on disallowed schemes, oversized
+     * payloads, or undecodable images.
+     */
+    fun loadImageBytesForAICore(url: String): ByteArray = loadImageBytes(url)
+
     private fun loadImageBytes(url: String): ByteArray {
         val raw: ByteArray = when {
             url.startsWith("data:") -> decodeDataImageUrl(url)

@@ -13,6 +13,7 @@ import com.localllm.app.inference.EmbeddingRegistry
 import com.localllm.app.inference.EngineRegistry
 import com.localllm.app.inference.litert.SessionManager
 import com.localllm.app.rag.DocumentStore
+import com.localllm.app.server.NsdBroadcaster
 import com.localllm.app.server.ServerDeps
 import com.localllm.app.server.ServerEngine
 import io.ktor.server.engine.EmbeddedServer
@@ -102,6 +103,7 @@ class LLMServerService : Service() {
     private val engineRegistry by lazy { EngineRegistry(this) }
     private val embeddingRegistry by lazy { EmbeddingRegistry(this) }
     private val sessionManager by lazy { SessionManager(engineRegistry) }
+    private val nsdBroadcaster by lazy { NsdBroadcaster(this) }
 
     private val deps by lazy {
         ServerDeps(
@@ -284,6 +286,11 @@ class LLMServerService : Service() {
             ServerState.setBoundUrl("http://$displayHost:$port")
             ServerState.setStatus(ServerState.Status.RUNNING)
             LogManager.i("LLMServerService", "Server listening on http://$displayHost:$port")
+            try {
+                nsdBroadcaster.start(host = displayHost, port = port)
+            } catch (e: Throwable) {
+                LogManager.w("LLMServerService", "NSD broadcast failed: ${e.message}")
+            }
         } catch (e: Exception) {
             ServerState.setStatus(ServerState.Status.ERROR)
             val msg = e.message ?: e.javaClass.simpleName
@@ -337,6 +344,7 @@ class LLMServerService : Service() {
         idleMonitorJob?.cancel()
         serviceScope.cancel()
         try { if (wakeLock.isHeld) wakeLock.release() } catch (_: Exception) {}
+        try { nsdBroadcaster.stop() } catch (_: Exception) {}
         try {
             server?.stop(500, 1000)
             server = null

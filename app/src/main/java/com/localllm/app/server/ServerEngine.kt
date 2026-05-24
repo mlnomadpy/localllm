@@ -7,6 +7,7 @@ import com.localllm.app.server.routes.chatRoute
 import com.localllm.app.server.routes.documentsRoute
 import com.localllm.app.server.routes.embeddingsRoute
 import com.localllm.app.server.routes.healthRoute
+import com.localllm.app.server.routes.metricsRoute
 import com.localllm.app.server.routes.modelsRoute
 import io.ktor.serialization.gson.gson
 import io.ktor.server.engine.EmbeddedServer
@@ -53,7 +54,8 @@ object ServerEngine {
                 }
             }
             routing {
-                healthRoute(deps.engineRegistry)
+                healthRoute(deps.engineRegistry, deps.appContext, deps.inferenceMutex)
+                metricsRoute(deps.engineRegistry)
                 modelsRoute(deps.appContext, deps.embeddingRegistry)
                 embeddingsRoute(deps.appContext, deps.embeddingRegistry, deps.lastActivityAt)
                 documentsRoute(

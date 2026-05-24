@@ -4,6 +4,7 @@ import com.google.mlkit.genai.common.DownloadStatus
 import com.google.mlkit.genai.prompt.GenerateContentRequest
 import com.google.mlkit.genai.prompt.Generation
 import com.google.mlkit.genai.prompt.GenerativeModel
+import com.google.mlkit.genai.prompt.ImagePart
 import com.google.mlkit.genai.prompt.ModelPreference
 import com.google.mlkit.genai.prompt.ModelReleaseStage
 import com.google.mlkit.genai.prompt.TextPart
@@ -172,8 +173,9 @@ object AICoreEngine {
         temperature: Float? = null,
         topK: Int? = null,
         maxOutputTokens: Int? = null,
+        image: ByteArray? = null,
     ): Flow<String> = flow {
-        val request = buildRequest(prompt, temperature, topK, maxOutputTokens)
+        val request = buildRequest(prompt, temperature, topK, maxOutputTokens, image)
         client().generateContentStream(request).collect { response ->
             val text = response.candidates.firstOrNull()?.text ?: return@collect
             emit(text)
@@ -186,8 +188,9 @@ object AICoreEngine {
         temperature: Float? = null,
         topK: Int? = null,
         maxOutputTokens: Int? = null,
+        image: ByteArray? = null,
     ): String {
-        val request = buildRequest(prompt, temperature, topK, maxOutputTokens)
+        val request = buildRequest(prompt, temperature, topK, maxOutputTokens, image)
         val response = client().generateContent(request)
         return response.candidates.firstOrNull()?.text.orEmpty()
     }
@@ -197,8 +200,18 @@ object AICoreEngine {
         temperature: Float?,
         topK: Int?,
         maxOutputTokens: Int?,
+        image: ByteArray?,
     ): GenerateContentRequest {
-        val builder = GenerateContentRequest.Builder(TextPart(prompt))
+        val textPart = TextPart(prompt)
+        val builder = if (image != null && image.isNotEmpty()) {
+            // Two-arg constructor: image + text. ML Kit's Prompt API accepts
+            // a single image per request — if the OpenAI message carries
+            // multiple image_url parts the caller is responsible for picking
+            // one.
+            GenerateContentRequest.Builder(ImagePart(image), textPart)
+        } else {
+            GenerateContentRequest.Builder(textPart)
+        }
         temperature?.let { builder.temperature = it }
         topK?.let { builder.topK = it }
         maxOutputTokens?.let { builder.maxOutputTokens = it }
