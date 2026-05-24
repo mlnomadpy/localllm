@@ -1,0 +1,588 @@
+package com.localllm.app.server.routes
+
+import com.google.ai.edge.litertlm.Message as LlmMessage
+import com.google.ai.edge.litertlm.ToolCall
+import com.google.gson.Gson
+import com.localllm.app.ChatRequest
+import com.localllm.app.ChatResponse
+import com.localllm.app.Choice
+import com.localllm.app.ContentPart
+import com.localllm.app.ErrorDetails
+import com.localllm.app.ErrorResponse
+import com.localllm.app.LogManager
+import com.localllm.app.Message
+import com.localllm.app.RequestTracker
+import com.localllm.app.Settings
+import com.localllm.app.StreamChoice
+import com.localllm.app.StreamDelta
+import com.localllm.app.StreamResponse
+import com.localllm.app.ToolCallApi
+import com.localllm.app.ToolCallFunction
+import com.localllm.app.contentParts
+import com.localllm.app.contentString
+import com.localllm.app.inference.EngineRegistry
+import com.localllm.app.inference.aicore.AICoreEngine
+import com.localllm.app.inference.litert.LlmMessageConverter
+import com.localllm.app.inference.litert.SessionManager
+import com.localllm.app.server.ServerDeps
+import com.localllm.app.server.auth.authorize
+import com.localllm.app.stringContent
+import com.localllm.app.textChars
+import io.ktor.http.CacheControl
+import io.ktor.http.ContentType
+import io.ktor.http.HttpStatusCode
+import io.ktor.server.request.receive
+import io.ktor.server.response.cacheControl
+import io.ktor.server.response.header
+import io.ktor.server.response.respond
+import io.ktor.server.response.respondBytesWriter
+import io.ktor.server.routing.Route
+import io.ktor.server.routing.post
+import io.ktor.utils.io.ByteWriteChannel
+import io.ktor.utils.io.writeStringUtf8
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+
+/**
+ * `POST /v1/chat/completions` — OpenAI-compatible. The single biggest route
+ * in the codebase: handles request validation, rate limiting, queue depth,
+ * engine acquisition (catalog-driven backend selection), session reuse for
+ * LiteRT, the AICore bypass, streaming SSE, non-streaming JSON, tool-call
+ * round-trips, and timeout / cancellation cleanup.
+ *
+ * The catalog-declared backend is the only signal — there is no AUTO chain
+ * here anymore. AICore models bypass the inference mutex entirely (the
+ * system service handles serialization); LiteRT models hold the mutex
+ * across `runInference*` so we never have two engines pumping the JNI
+ * runtime at once.
+ *
+ * If `req.model` is absent or empty, the handler falls back to the
+ * persisted [Settings.selectedModelId] (which defaults to AICore).
+ */
+fun Route.chatRoute(deps: ServerDeps) {
+    val gson = Gson()
+    post("/v1/chat/completions") {
+        if (!authorize(call, deps.appContext)) return@post
+        deps.lastActivityAt.set(System.currentTimeMillis())
+
+        // Per-client rate limit, keyed on User-Agent. rate=0 disables.
+        val clientId = call.request.headers["User-Agent"]?.takeIf { it.isNotBlank() } ?: "anonymous"
+        val rate = Settings.rateLimitPerSec(deps.appContext)
+        if (rate > 0.0) {
+            deps.rateLimiter.ratePerSec = rate
+            deps.rateLimiter.burst = Settings.rateLimitBurst(deps.appContext)
+            val retryAfter = deps.rateLimiter.tryAcquire(clientId)
+            if (retryAfter != null) {
+                call.response.header("Retry-After", retryAfter.toString())
+                call.response.header("X-RateLimit-Client", clientId)
+                call.respond(
+                    HttpStatusCode.TooManyRequests,
+                    ErrorResponse(ErrorDetails(
+                        message = "Rate limit for client '$clientId' exhausted; retry in ${retryAfter}s.",
+                        type = "rate_limit_error",
+                        code = 429,
+                    )),
+                )
+                return@post
+            }
+        }
+
+        // Body-size guard. ~2 bytes per char covers JSON overhead with margin.
+        val maxChars = Settings.maxPromptChars(deps.appContext)
+        val bodyCap = maxChars.toLong() * 2L + 8_192L
+        val contentLength = call.request.headers["Content-Length"]?.toLongOrNull()
+        if (contentLength != null && contentLength > bodyCap) {
+            call.respond(
+                HttpStatusCode.PayloadTooLarge,
+                ErrorResponse(ErrorDetails(
+                    message = "Request body of $contentLength bytes exceeds cap of $bodyCap",
+                    type = "invalid_request_error",
+                    code = 413,
+                )),
+            )
+            return@post
+        }
+
+        val rawReq = try {
+            call.receive<ChatRequest>()
+        } catch (e: Exception) {
+            LogManager.e("ChatRoute", "Failed to parse ChatRequest body", e)
+            val rootCause = generateSequence(e as Throwable?) { it.cause }.lastOrNull() ?: e
+            call.respond(
+                HttpStatusCode.BadRequest,
+                ErrorResponse(ErrorDetails(
+                    message = "Invalid JSON body: ${rootCause.javaClass.simpleName}: ${rootCause.message ?: e.message}",
+                    type = "invalid_request_error",
+                    code = 400,
+                )),
+            )
+            return@post
+        }
+
+        // Default model resolution: missing/empty `model` falls back to the
+        // selected model id (which defaults to AICore). The AUTO fallback
+        // used to pick the first downloaded `.litertlm`; that selection now
+        // belongs to the user (via Settings) and is explicit.
+        val req = if (rawReq.model.isBlank()) {
+            rawReq.copy(model = Settings.selectedModelId(deps.appContext))
+        } else rawReq
+
+        val promptChars = req.messages.sumOf { it.textChars() }
+        if (promptChars > maxChars) {
+            call.respond(
+                HttpStatusCode.PayloadTooLarge,
+                ErrorResponse(ErrorDetails(
+                    message = "Prompt of $promptChars chars exceeds limit of $maxChars",
+                    type = "invalid_request_error",
+                    code = 413,
+                )),
+            )
+            return@post
+        }
+
+        val maxDepth = Settings.maxQueueDepth(deps.appContext)
+        val entry = RequestTracker.tryEnqueue(
+            model = req.model,
+            stream = req.stream,
+            messageCount = req.messages.size,
+            promptChars = promptChars,
+            maxDepth = maxDepth,
+            client = clientId,
+        )
+        if (entry == null) {
+            call.response.header("Retry-After", "5")
+            call.respond(
+                HttpStatusCode.TooManyRequests,
+                ErrorResponse(ErrorDetails(
+                    message = "Queue full ($maxDepth in flight). Retry shortly.",
+                    type = "rate_limit_error",
+                    code = 429,
+                )),
+            )
+            return@post
+        }
+
+        val queueDepth = RequestTracker.queue.value.size
+        val queuePosition = RequestTracker.queue.value.indexOfFirst { it.id == entry.id } + 1
+        val avgInfMs = RequestTracker.stats.value.avgLatencyMs
+        val estimatedWaitMs = (queuePosition - 1).coerceAtLeast(0) * avgInfMs
+        call.response.header("X-Queue-Position", queuePosition.toString())
+        call.response.header("X-Queue-Depth", queueDepth.toString())
+        call.response.header("X-Estimated-Wait-Ms", estimatedWaitMs.toString())
+        call.response.header("X-Request-Id", entry.id)
+        call.response.header("X-Client-Id", clientId)
+
+        val remoteIp = call.request.local.remoteHost
+        val ua = clientId
+        val timeoutMs = Settings.requestTimeoutMs(deps.appContext)
+
+        var resolved: SessionManager.Resolved? = null
+        var inferenceOk = false
+        var streamWriter: ByteWriteChannel? = null
+        try {
+            LogManager.i(
+                "ChatRoute",
+                "Request #${entry.id} from $remoteIp [$ua]: model=${req.model}, stream=${req.stream}, msgs=${req.messages.size}, chars=$promptChars, session=${req.sessionId?.ifEmpty { null } ?: "(stateless)"}",
+            )
+
+            val responseId = "chatcmpl-${entry.id}"
+            val temp = req.temperature ?: Settings.temperature(deps.appContext)
+            val topK = req.topK ?: Settings.topK(deps.appContext)
+
+            when (val acquired = deps.engineRegistry.acquire(req.model, req.maxTokens)) {
+                is EngineRegistry.AcquiredEngine.AiCore -> {
+                    // AICore preflight — surfaces a clean error before
+                    // we commit response headers / SSE prelude.
+                    deps.engineRegistry.ensureAiCoreReady()
+                    val flatPrompt = flattenForAICore(req.messages)
+                    if (req.stream) {
+                        call.response.cacheControl(CacheControl.NoCache(null))
+                        call.respondBytesWriter(contentType = ContentType.Text.EventStream) {
+                            streamWriter = this@respondBytesWriter
+                            withTimeout(timeoutMs) {
+                                RequestTracker.markStarted(entry.id)
+                                runAICoreStreaming(
+                                    writer = this@respondBytesWriter,
+                                    prompt = flatPrompt,
+                                    temperature = temp,
+                                    topK = topK,
+                                    maxOutputTokens = req.maxTokens,
+                                    responseId = responseId,
+                                    modelName = req.model,
+                                    requestEntryId = entry.id,
+                                    gson = gson,
+                                    onChunk = { delta -> RequestTracker.recordChunk(entry.id, delta) },
+                                )
+                            }
+                        }
+                    } else {
+                        val text = withTimeout(timeoutMs) {
+                            RequestTracker.markStarted(entry.id)
+                            AICoreEngine.complete(
+                                prompt = flatPrompt,
+                                temperature = temp,
+                                topK = topK,
+                                maxOutputTokens = req.maxTokens,
+                            )
+                        }
+                        RequestTracker.recordChunk(entry.id, text)
+                        call.respond(ChatResponse(
+                            id = responseId,
+                            `object` = "chat.completion",
+                            created = System.currentTimeMillis() / 1000,
+                            model = req.model,
+                            choices = listOf(Choice(
+                                index = 0,
+                                message = Message(role = "assistant", content = stringContent(text)),
+                                finishReason = "stop",
+                            )),
+                        ))
+                    }
+                    inferenceOk = true
+                    RequestTracker.markCompleted(entry.id)
+                    deps.lastActivityAt.set(System.currentTimeMillis())
+                    return@post
+                }
+                is EngineRegistry.AcquiredEngine.LiteRt -> {
+                    val resolvedLocal = deps.sessionManager.resolve(req, acquired, temp, topK)
+                    resolved = resolvedLocal
+                    val needWakeLock = Settings.keepAwake(deps.appContext)
+
+                    if (req.stream) {
+                        call.response.cacheControl(CacheControl.NoCache(null))
+                        call.respondBytesWriter(contentType = ContentType.Text.EventStream) {
+                            streamWriter = this@respondBytesWriter
+                            withTimeout(timeoutMs) {
+                                deps.inferenceMutex.withLock {
+                                    RequestTracker.markStarted(entry.id)
+                                    deps.acquireWakeLock(timeoutMs) {
+                                        runInferenceStreaming(
+                                            conversation = resolvedLocal.conversation,
+                                            prompt = resolvedLocal.prompt,
+                                            writer = this@respondBytesWriter,
+                                            responseId = responseId,
+                                            requestEntryId = entry.id,
+                                            modelName = req.model,
+                                            gson = gson,
+                                            deps = deps,
+                                            onChunk = { chunk -> RequestTracker.recordChunk(entry.id, chunk) },
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        val finalMsg = withTimeout(timeoutMs) {
+                            deps.inferenceMutex.withLock {
+                                RequestTracker.markStarted(entry.id)
+                                var result: LlmMessage? = null
+                                deps.acquireWakeLock(timeoutMs) {
+                                    result = withContext(Dispatchers.Default) {
+                                        resolvedLocal.conversation.sendMessage(resolvedLocal.prompt, emptyMap())
+                                    }
+                                }
+                                result!!
+                            }
+                        }
+                        val responseText = LlmMessageConverter.messageText(finalMsg)
+                        RequestTracker.recordChunk(entry.id, responseText)
+
+                        val toolCalls = finalMsg.toolCalls
+                        val choice = if (!toolCalls.isNullOrEmpty()) {
+                            Choice(
+                                index = 0,
+                                message = Message(
+                                    role = "assistant",
+                                    content = null,
+                                    toolCalls = toolCalls.mapIndexed { i, tc ->
+                                        ToolCallApi(
+                                            id = "call_${entry.id}_$i",
+                                            type = "function",
+                                            function = ToolCallFunction(
+                                                name = tc.name,
+                                                arguments = gson.toJson(tc.arguments),
+                                            ),
+                                        )
+                                    },
+                                ),
+                                finishReason = "tool_calls",
+                            )
+                        } else {
+                            Choice(
+                                index = 0,
+                                message = Message(role = "assistant", content = stringContent(responseText)),
+                                finishReason = "stop",
+                            )
+                        }
+                        call.respond(ChatResponse(
+                            id = responseId,
+                            `object` = "chat.completion",
+                            created = System.currentTimeMillis() / 1000,
+                            model = req.model,
+                            choices = listOf(choice),
+                        ))
+                    }
+                    inferenceOk = true
+                    RequestTracker.markCompleted(entry.id)
+                    deps.lastActivityAt.set(System.currentTimeMillis())
+                }
+            }
+        } catch (te: TimeoutCancellationException) {
+            LogManager.e("ChatRoute", "Request #${entry.id} timed out after ${timeoutMs} ms")
+            try { resolved?.conversation?.cancelProcess() } catch (_: Exception) {}
+            RequestTracker.markCompleted(entry.id, error = "timeout after ${timeoutMs} ms")
+            val w = streamWriter
+            if (w != null) {
+                writeSseError(w, "Inference timeout", "timeout", 408, gson)
+            } else {
+                try {
+                    call.respond(
+                        HttpStatusCode.RequestTimeout,
+                        ErrorResponse(ErrorDetails("Inference timeout", "timeout", 408)),
+                    )
+                } catch (_: Exception) { /* stream already started */ }
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            try { resolved?.conversation?.cancelProcess() } catch (_: Exception) {}
+            RequestTracker.markCompleted(entry.id, cancelled = true)
+            throw ce
+        } catch (e: Exception) {
+            LogManager.e("ChatRoute", "Request #${entry.id} error", e)
+            RequestTracker.markCompleted(entry.id, error = e.message ?: e.javaClass.simpleName)
+            val w = streamWriter
+            if (w != null) {
+                writeSseError(w, e.message ?: "Unknown error", "server_error", 500, gson)
+            } else {
+                try {
+                    call.respond(
+                        HttpStatusCode.InternalServerError,
+                        ErrorResponse(ErrorDetails(
+                            message = e.message ?: "Unknown error",
+                            type = "server_error",
+                            code = 500,
+                        )),
+                    )
+                } catch (_: Exception) { /* stream already started */ }
+            }
+        } finally {
+            val r = resolved
+            if (r != null) {
+                if (r.isCached) {
+                    if (inferenceOk) deps.sessionManager.commit(r, req.messages)
+                    else deps.sessionManager.invalidate(r)
+                } else {
+                    deps.sessionManager.closeIfStateless(r)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Flatten an OpenAI chat-history into a single string prompt for AICore.
+ * AICore's `GenerateContentRequest` takes a `TextPart(string)` only; there
+ * is no first-class system / role slot.
+ */
+private fun flattenForAICore(messages: List<Message>): String {
+    val sb = StringBuilder()
+    for (m in messages) {
+        val text = m.contentString() ?: m.contentParts()
+            .filterIsInstance<ContentPart.TextPart>()
+            .joinToString(" ") { it.text }
+        if (text.isBlank()) continue
+        val label = when (m.role) {
+            "system" -> "system"
+            "assistant" -> "assistant"
+            "tool" -> "tool"
+            else -> "user"
+        }
+        sb.append(label).append(": ").append(text).append("\n\n")
+    }
+    sb.append("assistant: ")
+    return sb.toString()
+}
+
+private suspend fun runAICoreStreaming(
+    writer: ByteWriteChannel,
+    prompt: String,
+    temperature: Float?,
+    topK: Int?,
+    maxOutputTokens: Int?,
+    responseId: String,
+    modelName: String,
+    requestEntryId: String,
+    gson: Gson,
+    onChunk: (String) -> Unit,
+) {
+    suspend fun safeWrite(s: String) {
+        try { writer.writeStringUtf8(s); writer.flush() } catch (_: Throwable) { /* peer gone */ }
+    }
+    val initResp = StreamResponse(
+        id = responseId,
+        `object` = "chat.completion.chunk",
+        created = System.currentTimeMillis() / 1000,
+        model = modelName,
+        choices = listOf(StreamChoice(0, StreamDelta(role = "assistant"), null)),
+    )
+    safeWrite("data: ${gson.toJson(initResp)}\n\n")
+
+    var prev = ""
+    AICoreEngine.stream(
+        prompt = prompt,
+        temperature = temperature,
+        topK = topK,
+        maxOutputTokens = maxOutputTokens,
+    ).collect { full ->
+        val delta = when {
+            full.startsWith(prev) && full.length > prev.length -> full.substring(prev.length)
+            full == prev -> ""
+            else -> full
+        }
+        if (delta.isEmpty()) return@collect
+        prev = if (full.startsWith(prev)) full else prev + delta
+        onChunk(delta)
+        val chunkResp = StreamResponse(
+            id = responseId,
+            `object` = "chat.completion.chunk",
+            created = System.currentTimeMillis() / 1000,
+            model = modelName,
+            choices = listOf(StreamChoice(0, StreamDelta(content = delta), null)),
+        )
+        safeWrite("data: ${gson.toJson(chunkResp)}\n\n")
+    }
+    val finalResp = StreamResponse(
+        id = responseId,
+        `object` = "chat.completion.chunk",
+        created = System.currentTimeMillis() / 1000,
+        model = modelName,
+        choices = listOf(StreamChoice(0, StreamDelta(), "stop")),
+    )
+    safeWrite("data: ${gson.toJson(finalResp)}\n\n")
+    safeWrite("data: [DONE]\n\n")
+}
+
+private suspend fun runInferenceStreaming(
+    conversation: com.google.ai.edge.litertlm.Conversation,
+    prompt: LlmMessage,
+    writer: ByteWriteChannel,
+    responseId: String,
+    requestEntryId: String,
+    modelName: String,
+    gson: Gson,
+    deps: ServerDeps,
+    onChunk: (String) -> Unit = {},
+) {
+    val writeMutex = Mutex()
+    suspend fun safeWrite(s: String) {
+        writeMutex.withLock {
+            writer.writeStringUtf8(s)
+            writer.flush()
+        }
+    }
+    val heartbeat = deps.serviceScope.launch {
+        while (isActive) {
+            delay(10_000L)
+            try { safeWrite(": ka\n\n") } catch (_: Throwable) { return@launch }
+        }
+    }
+    try {
+        val initResp = StreamResponse(
+            id = responseId,
+            `object` = "chat.completion.chunk",
+            created = System.currentTimeMillis() / 1000,
+            model = modelName,
+            choices = listOf(StreamChoice(0, StreamDelta(role = "assistant"), null)),
+        )
+        safeWrite("data: ${gson.toJson(initResp)}\n\n")
+
+        var prev = ""
+        var lastToolCalls: List<ToolCall>? = null
+        conversation.sendMessageAsync(prompt, emptyMap()).collect { msg ->
+            msg.toolCalls?.takeIf { it.isNotEmpty() }?.let { lastToolCalls = it }
+
+            val full = LlmMessageConverter.messageText(msg)
+            val delta = if (full.startsWith(prev) && full.length > prev.length) full.substring(prev.length)
+                        else if (full == prev) ""
+                        else full
+            if (delta.isNotEmpty()) {
+                prev = if (full.startsWith(prev)) full else prev + delta
+                onChunk(delta)
+                val chunkResp = StreamResponse(
+                    id = responseId,
+                    `object` = "chat.completion.chunk",
+                    created = System.currentTimeMillis() / 1000,
+                    model = modelName,
+                    choices = listOf(StreamChoice(0, StreamDelta(content = delta), null)),
+                )
+                safeWrite("data: ${gson.toJson(chunkResp)}\n\n")
+            }
+        }
+
+        val tc = lastToolCalls
+        val finalResp = if (!tc.isNullOrEmpty()) {
+            StreamResponse(
+                id = responseId,
+                `object` = "chat.completion.chunk",
+                created = System.currentTimeMillis() / 1000,
+                model = modelName,
+                choices = listOf(
+                    StreamChoice(
+                        0,
+                        StreamDelta(
+                            toolCalls = tc.mapIndexed { i, t ->
+                                ToolCallApi(
+                                    id = "call_${requestEntryId}_$i",
+                                    type = "function",
+                                    function = ToolCallFunction(
+                                        name = t.name,
+                                        arguments = gson.toJson(t.arguments),
+                                    ),
+                                )
+                            },
+                        ),
+                        "tool_calls",
+                    ),
+                ),
+            )
+        } else {
+            StreamResponse(
+                id = responseId,
+                `object` = "chat.completion.chunk",
+                created = System.currentTimeMillis() / 1000,
+                model = modelName,
+                choices = listOf(StreamChoice(0, StreamDelta(), "stop")),
+            )
+        }
+        safeWrite("data: ${gson.toJson(finalResp)}\n\n")
+        safeWrite("data: [DONE]\n\n")
+    } finally {
+        heartbeat.cancel()
+    }
+}
+
+private suspend fun writeSseError(
+    writer: ByteWriteChannel,
+    message: String,
+    type: String,
+    code: Int,
+    gson: Gson,
+) {
+    try {
+        val json = gson.toJson(ErrorResponse(ErrorDetails(message, type, code)))
+        writer.writeStringUtf8("data: $json\n\n")
+        writer.writeStringUtf8("data: [DONE]\n\n")
+        writer.flush()
+    } catch (_: java.io.IOException) {
+        /* Client gone; nothing actionable. */
+    } catch (_: Exception) {
+        /* Defensive: never let error-reporting itself throw out of a catch arm. */
+    }
+}

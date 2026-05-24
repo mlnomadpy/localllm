@@ -1,4 +1,4 @@
-package com.localllm.app.aicore
+package com.localllm.app.inference.aicore
 
 import com.google.mlkit.genai.prompt.GenerateContentRequest
 import com.google.mlkit.genai.prompt.Generation
