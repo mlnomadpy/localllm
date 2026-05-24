@@ -4,6 +4,7 @@ import com.google.ai.edge.litertlm.Engine as LiteRtNativeEngine
 import com.localllm.app.Backend
 import com.localllm.app.LogManager
 import com.localllm.app.inference.Engine
+import com.localllm.app.inference.EngineKey
 
 /**
  * [Engine] wrapper around a LiteRT-LM native engine. Holds the cache key
@@ -19,7 +20,7 @@ class LiteRtEngine(
     override val modelId: String,
     override val backend: Backend,
     val native: LiteRtNativeEngine,
-    val cacheKey: String,
+    val cacheKey: EngineKey,
 ) : Engine {
 
     @Volatile private var closed = false
@@ -28,7 +29,7 @@ class LiteRtEngine(
         if (closed) return
         closed = true
         try { native.close() } catch (e: Exception) {
-            LogManager.e("LiteRtEngine", "Error closing native engine $cacheKey", e)
+            LogManager.e("LiteRtEngine", "Error closing native engine ${cacheKey.asString()}", e)
         }
     }
 }

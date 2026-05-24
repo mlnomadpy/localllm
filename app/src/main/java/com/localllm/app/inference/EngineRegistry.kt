@@ -50,7 +50,14 @@ class EngineRegistry(
         val durationMs: Long,
     )
 
-    /** Public view of a cached engine entry — surfaced via /health. */
+    /**
+     * Public view of a cached engine entry — surfaced via /health.
+     *
+     * [cacheKey] is kept as a plain [String] (via [EngineKey.asString]) so
+     * that the `/health` JSON response continues to emit a flat string for the
+     * `engines[].key` field. Changing it to [EngineKey] here would cause Gson
+     * to serialize it as a nested object, breaking existing monitoring clients.
+     */
     data class CachedEngineInfo(
         val cacheKey: String,
         val backend: String,
@@ -63,20 +70,20 @@ class EngineRegistry(
     )
 
     /**
-     * LiteRT-LM engine LRU. Keyed by `model_maxTokens_backend` because
-     * LiteRT-LM's `EngineConfig.maxNumTokens` is the *total* KV-cache budget
-     * (input + output); reusing an engine built with a larger budget for a
-     * request that asked for less would let the model overgenerate.
+     * LiteRT-LM engine LRU. Keyed by [EngineKey] because LiteRT-LM's
+     * `EngineConfig.maxNumTokens` is the *total* KV-cache budget (input +
+     * output); reusing an engine built with a larger budget for a request that
+     * asked for less would let the model overgenerate.
      *
      * Conversations attached to an evicted engine MUST be torn down first —
      * a conversation outliving its parent engine is undefined behavior on
      * the native side. The [onLiteRtEvicted] callback handles that
      * coordination; the chat route registers it before serving traffic.
      */
-    private val liteRtEngines = object : LruCache<String, LiteRtCacheEntry>(maxResidentLiteRt) {
+    private val liteRtEngines = object : LruCache<EngineKey, LiteRtCacheEntry>(maxResidentLiteRt) {
         override fun entryRemoved(
             evicted: Boolean,
-            key: String?,
+            key: EngineKey?,
             oldValue: LiteRtCacheEntry?,
             newValue: LiteRtCacheEntry?,
         ) {
@@ -87,9 +94,9 @@ class EngineRegistry(
                 try { onLiteRtEvicted?.invoke(key) } catch (_: Throwable) {}
                 try {
                     oldValue.engine.close()
-                    if (evicted) LogManager.i("EngineRegistry", "Evicted engine: $key")
+                    if (evicted) LogManager.i("EngineRegistry", "Evicted engine: ${key.asString()}")
                 } catch (e: Exception) {
-                    LogManager.e("EngineRegistry", "Error closing evicted engine $key", e)
+                    LogManager.e("EngineRegistry", "Error closing evicted engine ${key.asString()}", e)
                 }
             }
         }
@@ -103,14 +110,18 @@ class EngineRegistry(
      * by [purgeConversationsForEngine] so the chat route's session cleanup
      * stays in one place.
      */
-    val activeConversations = ConcurrentHashMap<String, Conversation>()
+    val activeConversations = ConcurrentHashMap<EngineKey, Conversation>()
 
     /**
      * Listener invoked when a LiteRT engine entry is removed (eviction or
-     * explicit drop). Registered by the chat route so it can flush its
-     * conversation cache before the engine is closed.
+     * explicit drop). Registered by [com.localllm.app.inference.litert.SessionManager]
+     * so it can flush its conversation cache before the engine is closed.
+     *
+     * The callback receives a typed [EngineKey] (not the old flat string) so
+     * the session manager can match against its own [EngineKey]-keyed state
+     * without reparsing.
      */
-    @Volatile var onLiteRtEvicted: ((cacheKey: String) -> Unit)? = null
+    @Volatile var onLiteRtEvicted: ((cacheKey: EngineKey) -> Unit)? = null
 
     /** Resolve a model id to its catalog entry, or treat as side-loaded LiteRT-CPU. */
     fun resolveModelInfo(modelId: String): ModelInfo {
@@ -180,7 +191,7 @@ class EngineRegistry(
     }
 
     private fun acquireLiteRt(info: ModelInfo, maxTokens: Int?): AcquiredEngine.LiteRt {
-        val cacheKey = "${info.id}_${maxTokens ?: "model"}_${info.backend.name}"
+        val cacheKey = EngineKey(info.id, maxTokens, info.backend)
         liteRtEngines.get(cacheKey)?.let {
             return AcquiredEngine.LiteRt(it.engine, cacheKey, it.attempts)
         }
@@ -226,7 +237,7 @@ class EngineRegistry(
         val entry = LiteRtCacheEntry(wrapped, listOf(attempt))
         try {
             liteRtEngines.put(cacheKey, entry)
-            LogManager.i("EngineRegistry", "Engine $cacheKey ready (${info.backend.name}, ${attempt.durationMs}ms)")
+            LogManager.i("EngineRegistry", "Engine ${cacheKey.asString()} ready (${info.backend.name}, ${attempt.durationMs}ms)")
         } catch (e: Exception) {
             try { wrapped.close() } catch (_: Exception) {}
             throw e
@@ -234,10 +245,14 @@ class EngineRegistry(
         return AcquiredEngine.LiteRt(wrapped, cacheKey, listOf(attempt))
     }
 
-    /** Snapshot for /health. */
+    /**
+     * Snapshot for /health. Converts each [EngineKey] to its stable string
+     * form via [EngineKey.asString] so the `/health` `engines[].key` field
+     * remains a flat string in the JSON response.
+     */
     fun snapshot(): List<CachedEngineInfo> =
         liteRtEngines.snapshot().map { (key, v) ->
-            CachedEngineInfo(key, v.engine.backend.name, v.attempts)
+            CachedEngineInfo(key.asString(), v.engine.backend.name, v.attempts)
         }
 
     fun engineCount(): Int = liteRtEngines.size()
@@ -257,7 +272,7 @@ class EngineRegistry(
     }
 
     /** Drop a specific entry (used when an engine is found to be wedged). */
-    fun dropLiteRt(cacheKey: String) {
+    fun dropLiteRt(cacheKey: EngineKey) {
         liteRtEngines.remove(cacheKey)
     }
 
@@ -265,7 +280,7 @@ class EngineRegistry(
     sealed class AcquiredEngine {
         data class LiteRt(
             val engine: LiteRtEngine,
-            val cacheKey: String,
+            val cacheKey: EngineKey,
             val attempts: List<BackendAttempt>,
         ) : AcquiredEngine()
 

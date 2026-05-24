@@ -8,6 +8,7 @@ import com.localllm.app.LogManager
 import com.localllm.app.Message
 import com.localllm.app.ToolDef
 import com.localllm.app.contentString
+import com.localllm.app.inference.EngineKey
 import com.localllm.app.inference.EngineRegistry
 import com.localllm.app.messagesPrefixHash
 
@@ -33,7 +34,7 @@ class SessionManager(private val registry: EngineRegistry) {
         /** The freshly-arrived message to send via sendMessage[Async]. */
         val prompt: LlmMessage,
         val cacheKey: String?,
-        val engineKey: String,
+        val engineKey: EngineKey,
         val temperature: Float,
         val topK: Int,
     ) {
@@ -42,7 +43,7 @@ class SessionManager(private val registry: EngineRegistry) {
 
     private data class CachedSession(
         val conversation: Conversation,
-        val engineKey: String,
+        val engineKey: EngineKey,
         val temperature: Float,
         val topK: Int,
         val prefixHash: Long,
@@ -68,7 +69,7 @@ class SessionManager(private val registry: EngineRegistry) {
         // the registry's LRU, every conversation tied to it MUST be closed
         // first (a conversation outliving its engine is undefined on the
         // native side).
-        registry.onLiteRtEvicted = { engineKey ->
+        registry.onLiteRtEvicted = { engineKey: EngineKey ->
             val staleKeys = sessions.snapshot().filter { it.value.engineKey == engineKey }.keys
             staleKeys.forEach { sessions.remove(it) }
             registry.activeConversations.remove(engineKey)?.let { conv ->
@@ -112,7 +113,7 @@ class SessionManager(private val registry: EngineRegistry) {
             return Resolved(conversation, lastPrompt, null, acquired.cacheKey, temperature, topK)
         }
 
-        val cacheKey = "${req.sessionId}_${acquired.cacheKey}"
+        val cacheKey = "${req.sessionId}_${acquired.cacheKey.asString()}"
         val cached = sessions.get(cacheKey)
 
         val canReuse = cached != null &&
@@ -166,7 +167,7 @@ class SessionManager(private val registry: EngineRegistry) {
             )
         } catch (e: Exception) {
             if (e.message?.contains("session already exists", ignoreCase = true) == true) {
-                LogManager.w("SessionManager", "Engine ${acquired.cacheKey} stuck; evicting.")
+                LogManager.w("SessionManager", "Engine ${acquired.cacheKey.asString()} stuck; evicting.")
                 registry.dropLiteRt(acquired.cacheKey)
                 throw IllegalStateException("Engine had a stuck conversation; evicted. Please retry the request.", e)
             }
@@ -176,7 +177,7 @@ class SessionManager(private val registry: EngineRegistry) {
         return conv
     }
 
-    private fun purgeConversationsOnEngine(engineKey: String) {
+    private fun purgeConversationsOnEngine(engineKey: EngineKey) {
         val staleKeys = sessions.snapshot().filter { it.value.engineKey == engineKey }.keys
         staleKeys.forEach { sessions.remove(it) }
         registry.activeConversations.remove(engineKey)?.let { prior ->
