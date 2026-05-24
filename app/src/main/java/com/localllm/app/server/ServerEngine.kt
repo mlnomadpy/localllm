@@ -50,7 +50,12 @@ object ServerEngine {
                 healthRoute(deps.engineRegistry)
                 modelsRoute(deps.appContext, deps.embeddingRegistry)
                 embeddingsRoute(deps.appContext, deps.embeddingRegistry, deps.lastActivityAt)
-                documentsRoute(deps)
+                documentsRoute(
+                    deps.appContext,
+                    deps.embeddingRegistry,
+                    deps.documentStore,
+                    deps.lastActivityAt,
+                )
                 aiCoreRoute(deps.appContext)
                 benchmarkRoute(deps.appContext, deps.lastActivityAt)
                 chatRoute(deps)
