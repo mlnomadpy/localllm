@@ -2,6 +2,7 @@ package com.localllm.app.server
 
 import com.localllm.app.Settings
 import com.localllm.app.server.routes.aiCoreRoute
+import com.localllm.app.server.routes.benchmarkRoute
 import com.localllm.app.server.routes.chatRoute
 import com.localllm.app.server.routes.documentsRoute
 import com.localllm.app.server.routes.embeddingsRoute
@@ -51,6 +52,7 @@ object ServerEngine {
                 embeddingsRoute(deps)
                 documentsRoute(deps)
                 aiCoreRoute(deps)
+                benchmarkRoute(deps)
                 chatRoute(deps)
             }
         }

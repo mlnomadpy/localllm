@@ -160,17 +160,22 @@ class EngineRegistry(
     }
 
     /**
-     * Pre-flight check for AICore availability. Called from the chat route
-     * inside a coroutine so we can throw before the SSE response commits
-     * headers.
+     * Pre-flight check for AICore availability. Throws [AiCoreNotReadyException]
+     * carrying the SDK status code so the chat route can build a structured
+     * [com.localllm.app.RichErrorResponse] envelope without re-probing.
+     *
+     * Also catches probe failures (e.g. ErrorCode -101 when AICore isn't
+     * installed at all) and surfaces them as UNAVAILABLE with the underlying
+     * throwable attached.
      */
     suspend fun ensureAiCoreReady() {
-        val status = AICoreEngine.checkStatusCode()
+        val status = try {
+            AICoreEngine.checkStatusCode()
+        } catch (probeErr: Throwable) {
+            throw AiCoreNotReadyException(AICoreEngine.STATUS_UNAVAILABLE, probeErr)
+        }
         if (status != AICoreEngine.STATUS_AVAILABLE) {
-            throw IllegalStateException(
-                "AICore (Gemini Nano) is ${AICoreEngine.statusLabel(status)} on this device. " +
-                "Requires Pixel 8+ with the AICore system service; on a fresh device the model may need to download via AICore before the first call succeeds."
-            )
+            throw AiCoreNotReadyException(status)
         }
     }
 

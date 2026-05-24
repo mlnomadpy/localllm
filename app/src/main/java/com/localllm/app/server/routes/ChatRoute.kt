@@ -12,6 +12,8 @@ import com.localllm.app.ErrorResponse
 import com.localllm.app.LogManager
 import com.localllm.app.Message
 import com.localllm.app.RequestTracker
+import com.localllm.app.RichErrorDetails
+import com.localllm.app.RichErrorResponse
 import com.localllm.app.Settings
 import com.localllm.app.StreamChoice
 import com.localllm.app.StreamDelta
@@ -20,6 +22,7 @@ import com.localllm.app.ToolCallApi
 import com.localllm.app.ToolCallFunction
 import com.localllm.app.contentParts
 import com.localllm.app.contentString
+import com.localllm.app.inference.AiCoreNotReadyException
 import com.localllm.app.inference.EngineRegistry
 import com.localllm.app.inference.aicore.AICoreEngine
 import com.localllm.app.inference.litert.LlmMessageConverter
@@ -197,11 +200,27 @@ fun Route.chatRoute(deps: ServerDeps) {
             val temp = req.temperature ?: Settings.temperature(deps.appContext)
             val topK = req.topK ?: Settings.topK(deps.appContext)
 
-            when (val acquired = deps.engineRegistry.acquire(req.model, req.maxTokens)) {
+            val acquired = try {
+                deps.engineRegistry.acquire(req.model, req.maxTokens)
+            } catch (e: Throwable) {
+                LogManager.e("ChatRoute", "Engine acquire failed for ${req.model}", e)
+                RequestTracker.markCompleted(entry.id, error = "engine_acquire: ${e.message ?: e.javaClass.simpleName}")
+                val (httpStatus, details) = liteRtAcquireEnvelope(req.model, e)
+                call.respond(httpStatus, RichErrorResponse(details))
+                return@post
+            }
+            when (acquired) {
                 is EngineRegistry.AcquiredEngine.AiCore -> {
-                    // AICore preflight — surfaces a clean error before
-                    // we commit response headers / SSE prelude.
-                    deps.engineRegistry.ensureAiCoreReady()
+                    // AICore preflight — surfaces a structured envelope
+                    // before we commit response headers / SSE prelude.
+                    try {
+                        deps.engineRegistry.ensureAiCoreReady()
+                    } catch (notReady: AiCoreNotReadyException) {
+                        val (httpStatus, details) = aicoreNotReadyEnvelope(notReady.statusCode, notReady.probeError)
+                        call.respond(httpStatus, RichErrorResponse(details))
+                        RequestTracker.markCompleted(entry.id, error = "aicore_${details.code}")
+                        return@post
+                    }
                     val flatPrompt = flattenForAICore(req.messages)
                     if (req.stream) {
                         call.response.cacheControl(CacheControl.NoCache(null))
@@ -358,7 +377,15 @@ fun Route.chatRoute(deps: ServerDeps) {
             LogManager.e("ChatRoute", "Request #${entry.id} error", e)
             RequestTracker.markCompleted(entry.id, error = e.message ?: e.javaClass.simpleName)
             val w = streamWriter
-            if (w != null) {
+            // AICore failures get a structured envelope so the client can
+            // distinguish background-blocked (ErrorCode 30) from other runtime
+            // problems. LiteRT failures and unknowns collapse to the generic
+            // server_error path.
+            if (req.model == AICoreEngine.MODEL_ID) {
+                val (httpStatus, details) = aicoreRuntimeEnvelope(e)
+                if (w != null) writeSseRichError(w, details, gson)
+                else try { call.respond(httpStatus, RichErrorResponse(details)) } catch (_: Exception) {}
+            } else if (w != null) {
                 writeSseError(w, e.message ?: "Unknown error", "server_error", 500, gson)
             } else {
                 try {
@@ -585,4 +612,150 @@ private suspend fun writeSseError(
     } catch (_: Exception) {
         /* Defensive: never let error-reporting itself throw out of a catch arm. */
     }
+}
+
+/**
+ * SSE-side counterpart to the JSON [RichErrorResponse]. Used when an AICore
+ * failure fires AFTER the SSE response has already committed headers —
+ * serialises the envelope into the open stream and follows with the
+ * `[DONE]` sentinel so clients close cleanly.
+ */
+private suspend fun writeSseRichError(
+    writer: ByteWriteChannel,
+    details: RichErrorDetails,
+    gson: Gson,
+) {
+    try {
+        val json = gson.toJson(RichErrorResponse(details))
+        writer.writeStringUtf8("data: $json\n\n")
+        writer.writeStringUtf8("data: [DONE]\n\n")
+        writer.flush()
+    } catch (_: java.io.IOException) {
+    } catch (_: Exception) {
+    }
+}
+
+/**
+ * Build the AICore "not ready" structured envelope keyed by the SDK status
+ * code from [AICoreEngine.checkStatusCode]. Returns the envelope and the
+ * HTTP status to use:
+ *   - DOWNLOADABLE → 503 (Service Unavailable), actionable=true
+ *   - DOWNLOADING  → 425 (Too Early), actionable=true
+ *   - UNAVAILABLE  → 503, actionable=false
+ *   - any other    → 503, actionable=false
+ *
+ * [probeError] is non-null when the SDK threw during checkStatus — the
+ * underlying message is folded into the envelope so the client sees the
+ * real reason (typically ErrorCode -101 / "AICore not installed").
+ */
+internal fun aicoreNotReadyEnvelope(
+    statusCode: Int,
+    probeError: Throwable? = null,
+): Pair<HttpStatusCode, RichErrorDetails> {
+    val label = AICoreEngine.statusLabel(statusCode)
+    return when (statusCode) {
+        AICoreEngine.STATUS_DOWNLOADABLE -> HttpStatusCode.ServiceUnavailable to RichErrorDetails(
+            message = "AICore (Gemini Nano) is downloadable on this device. Tap the Models tab to provision it before retrying.",
+            type = "aicore_unavailable",
+            code = "AICORE_DOWNLOADABLE",
+            aicoreStatus = label,
+            actionable = true,
+            nextSteps = listOf(
+                "Open Models tab",
+                "Tap 'Download Gemini Nano'",
+                "Wait for status: Available",
+            ),
+        )
+        AICoreEngine.STATUS_DOWNLOADING -> HttpStatusCode(425, "Too Early") to RichErrorDetails(
+            message = "AICore (Gemini Nano) is downloading. Retry once the Models tab reports 'Available'.",
+            type = "aicore_unavailable",
+            code = "AICORE_DOWNLOADING",
+            aicoreStatus = label,
+            actionable = true,
+            nextSteps = listOf(
+                "Wait for the Models tab to show: Available",
+                "Retry the request",
+            ),
+        )
+        AICoreEngine.STATUS_UNAVAILABLE -> {
+            val reason = probeError?.message?.let { ": $it" } ?: ""
+            HttpStatusCode.ServiceUnavailable to RichErrorDetails(
+                message = "AICore (Gemini Nano) is not available on this device$reason. Requires Pixel 8+ with the AICore Developer Preview or an OEM build that ships the AICore system service.",
+                type = "aicore_unavailable",
+                code = "AICORE_UNAVAILABLE",
+                aicoreStatus = label,
+                actionable = false,
+                nextSteps = listOf(
+                    "Switch to a different model (e.g. gemma-4-e2b)",
+                ),
+            )
+        }
+        else -> HttpStatusCode.ServiceUnavailable to RichErrorDetails(
+            message = "AICore (Gemini Nano) is $label on this device.",
+            type = "aicore_unavailable",
+            code = "AICORE_UNKNOWN",
+            aicoreStatus = label,
+            actionable = false,
+            nextSteps = emptyList(),
+        )
+    }
+}
+
+/**
+ * Build the AICore runtime-failure envelope. Distinguishes ErrorCode 30
+ * (host activity not foreground) so the client can surface a foreground
+ * warning; other generate-side failures collapse to a generic runtime error.
+ *   - background-blocked → 403 (Forbidden), actionable=true
+ *   - other runtime      → 500, actionable=false
+ */
+internal fun aicoreRuntimeEnvelope(t: Throwable): Pair<HttpStatusCode, RichErrorDetails> {
+    val msg = t.message.orEmpty()
+    val isBackgroundBlocked = msg.contains("ErrorCode 30") ||
+        msg.contains("error code 30", ignoreCase = true) ||
+        msg.contains("Background usage is blocked", ignoreCase = true) ||
+        msg.contains("activity is not in foreground", ignoreCase = true) ||
+        (msg.contains("foreground", ignoreCase = true) && msg.contains("aicore", ignoreCase = true))
+    return if (isBackgroundBlocked) {
+        HttpStatusCode.Forbidden to RichErrorDetails(
+            message = "AICore (Gemini Nano) refused the call because the host app isn't in the foreground. Open the LocalLLM app and keep it visible while the HTTP client queries this model.",
+            type = "aicore_background_blocked",
+            code = "AICORE_BACKGROUND_BLOCKED",
+            aicoreStatus = "available",
+            actionable = true,
+            nextSteps = listOf(
+                "Bring the LocalLLM app to the foreground",
+                "Keep the Chat tab visible while the external client is connected",
+                "Retry the request",
+            ),
+        )
+    } else {
+        HttpStatusCode.InternalServerError to RichErrorDetails(
+            message = "AICore (Gemini Nano) call failed: ${t.message ?: t.javaClass.simpleName}",
+            type = "aicore_runtime_error",
+            code = "AICORE_RUNTIME_ERROR",
+            aicoreStatus = "unknown",
+            actionable = false,
+            nextSteps = emptyList(),
+        )
+    }
+}
+
+/**
+ * Build the LiteRT engine-init envelope. The acquire step throws when the
+ * model file is missing, the SoC marker doesn't match, or the vendor NPU
+ * delegate isn't loadable — surface a structured response with concrete
+ * next steps instead of a bare 500.
+ */
+internal fun liteRtAcquireEnvelope(modelId: String, t: Throwable): Pair<HttpStatusCode, RichErrorDetails> {
+    return HttpStatusCode.ServiceUnavailable to RichErrorDetails(
+        message = "LiteRT-LM engine failed to initialise for '$modelId': ${t.message ?: t.javaClass.simpleName}. The model file may be missing, the vendor delegate may be unavailable, or the .litertlm bundle may be incompatible with this device's SoC.",
+        type = "litert_engine_failed",
+        code = "LITERT_INIT_FAILED",
+        actionable = true,
+        nextSteps = listOf(
+            "Open the Models tab and confirm the model is downloaded",
+            "If the model is NPU-gated, check the SoC label matches this device",
+            "Try the AICore (gemini-nano-aicore) model instead",
+        ),
+    )
 }

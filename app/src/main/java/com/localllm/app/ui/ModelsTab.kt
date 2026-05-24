@@ -17,16 +17,23 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.DownloadForOffline
+import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material.icons.outlined.Verified
+import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -35,8 +42,17 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -46,10 +62,14 @@ import androidx.compose.material.icons.outlined.Memory
 import com.localllm.app.AVAILABLE_MODELS
 import com.localllm.app.Backend
 import com.localllm.app.ModelInfo
-import com.localllm.app.isVirtual
+import com.localllm.app.inference.aicore.AICoreEngine
 import com.localllm.app.matchesCurrentSoc
 import com.localllm.app.npuSocLabel
 import com.localllm.app.R
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun ModelsTab(
@@ -78,13 +98,12 @@ fun ModelsTab(
             description = customDesc,
             url = url,
             filename = fname,
-            // Custom URLs are assumed to be portable CPU LiteRT-LM bundles —
-            // we have no way to know otherwise. Catalog-declared NPU/GPU
-            // models live in AVAILABLE_MODELS, not here.
             backend = Backend.LITERT_CPU,
         )
     }
-    val all = builtIn + custom
+    // AICore gets its own dedicated card above; filter it out of the generic
+    // items() loop so it isn't rendered twice.
+    val all = (builtIn + custom).filter { it.backend != Backend.AICORE }
     val nothingInstalled = existingModels.isEmpty() && activeDownloads.isEmpty()
 
     LazyColumn(
@@ -94,6 +113,11 @@ fun ModelsTab(
         if (nothingInstalled) {
             item { EmptyHeroCard() }
         }
+
+        // AICore (Gemini Nano) — the default engine post-pivot. Shown at the
+        // top so the live status badge (Ready / Tap to download / Downloading
+        // / Not available) is the first thing a user sees on the Models tab.
+        item { AICoreModelCard() }
 
         item {
             OutlinedButton(
@@ -339,26 +363,6 @@ private fun ModelCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-            } else if (model.isVirtual) {
-                // Virtual entries (AICore etc.) have no file on disk and no
-                // download URL. Surface the "managed by the system" hint and
-                // hide the Download/Delete buttons that would otherwise fire
-                // a DownloadManager request against an empty URL and stall
-                // the active-downloads poll loop.
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = Icons.Outlined.Memory,
-                        contentDescription = null,
-                        modifier = Modifier.size(14.dp),
-                        tint = MaterialTheme.colorScheme.primary,
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "Provided by the system — no download needed",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
             } else {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -394,4 +398,296 @@ private fun ModelCard(
             }
         }
     }
+}
+
+/**
+ * Sentinel + state constants for the AICore live-status probe. Mirrors
+ * [AICoreEngine] but kept separate so we can model probe failures (the SDK
+ * throws when AICore isn't installed at all — typically ErrorCode -101)
+ * distinctly from the SDK-reported UNAVAILABLE state.
+ */
+private const val AICORE_PROBE_PENDING = -2
+private const val AICORE_PROBE_NOT_INSTALLED = -101
+
+/**
+ * AICore (Gemini Nano) catalog card. Renders a live status badge driven by
+ * [AICoreEngine.checkStatusCode] and surfaces:
+ *  - a "Default" pill (AICore is the post-pivot default engine);
+ *  - a status pill: Ready / Tap to download / Downloading / Not available /
+ *    Not installed;
+ *  - a foreground-foreground-required tip (AICore returns ErrorCode 30 when
+ *    the host activity is backgrounded);
+ *  - a Provision button for the DOWNLOADABLE state that triggers the
+ *    download via a no-op `complete("warmup")` call — the AICore SDK
+ *    implicitly fetches weights on the first generate call from a
+ *    foreground activity.
+ *
+ * The status is re-probed every 5s while the card is composed, plus once
+ * eagerly on first composition.
+ */
+@Composable
+private fun AICoreModelCard() {
+    val scope = rememberCoroutineScope()
+    var refreshTick by remember { mutableIntStateOf(0) }
+    var provisioning by remember { mutableStateOf(false) }
+
+    // produceState re-runs the producer whenever any key changes; bumping
+    // refreshTick after a provision attempt forces an immediate re-probe.
+    val statusCode by produceState<Int>(initialValue = AICORE_PROBE_PENDING, key1 = refreshTick) {
+        // Eager probe.
+        value = withContext(Dispatchers.Default) {
+            try { AICoreEngine.checkStatusCode() }
+            catch (_: Throwable) { AICORE_PROBE_NOT_INSTALLED }
+        }
+        // Poll while card is composed. 5s is a reasonable cadence — DOWNLOADING
+        // can take many minutes, and there's no callback API exposed by the SDK.
+        while (true) {
+            delay(5_000)
+            value = withContext(Dispatchers.Default) {
+                try { AICoreEngine.checkStatusCode() }
+                catch (_: Throwable) { AICORE_PROBE_NOT_INSTALLED }
+            }
+        }
+    }
+
+    OutlinedCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            // Title row: name + "Default" badge.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Outlined.AutoAwesome,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "Gemini Nano · AICore",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                DefaultBadge()
+            }
+
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "model id: ${AICoreEngine.MODEL_ID}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Spacer(Modifier.height(8.dp))
+            AICoreStatusBadge(statusCode = statusCode, provisioning = provisioning)
+
+            Spacer(Modifier.height(8.dp))
+            // Sub-text that explains the current state in plain words.
+            Text(
+                text = aicoreSubtext(statusCode),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            // Foreground-required tip. AICore returns ErrorCode 30 when the
+            // host activity isn't visible; an external HTTP client (curl,
+            // PWA) cannot satisfy this on its own.
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        MaterialTheme.colorScheme.surfaceVariant,
+                        RoundedCornerShape(8.dp)
+                    )
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.Top,
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Info,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "Tip: AICore requires this app to be in the foreground when an HTTP client queries Gemini Nano.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            // Provision button — only meaningful while AICore is DOWNLOADABLE.
+            if (statusCode == AICoreEngine.STATUS_DOWNLOADABLE) {
+                Spacer(Modifier.height(12.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    Button(
+                        enabled = !provisioning,
+                        onClick = {
+                            provisioning = true
+                            scope.launch {
+                                // The SDK doesn't expose a download() helper
+                                // via our wrapper; the canonical trigger is
+                                // a generate-from-foreground call. We use a
+                                // throwaway warmup prompt; output is ignored.
+                                try {
+                                    withContext(Dispatchers.Default) {
+                                        AICoreEngine.complete(prompt = "ok")
+                                    }
+                                } catch (_: Throwable) {
+                                    // Expected while download is still in
+                                    // progress — the next status probe will
+                                    // reflect the new DOWNLOADING state.
+                                }
+                                provisioning = false
+                                refreshTick++
+                            }
+                        },
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.CloudDownload,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("Download Gemini Nano")
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Small green "Default" badge for the AICore card title row. */
+@Composable
+private fun DefaultBadge() {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .background(
+                MaterialTheme.colorScheme.tertiaryContainer,
+                RoundedCornerShape(6.dp)
+            )
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Outlined.Star,
+            contentDescription = null,
+            modifier = Modifier.size(12.dp),
+            tint = MaterialTheme.colorScheme.onTertiaryContainer,
+        )
+        Spacer(Modifier.width(4.dp))
+        Text(
+            text = "Default",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onTertiaryContainer,
+        )
+    }
+}
+
+/**
+ * Coloured status pill for AICore. Mapping:
+ *  - AVAILABLE         → green "Ready" + check
+ *  - DOWNLOADABLE      → amber "Tap to download" + cloud
+ *  - DOWNLOADING       → amber "Downloading…" + spinner (or "Provisioning…"
+ *                        while the user-triggered warmup is in flight)
+ *  - UNAVAILABLE       → red "Not available on this device" + error
+ *  - PROBE_NOT_INSTALLED → red "AICore not installed" + error (caught -101)
+ *  - PROBE_PENDING     → muted "Checking…" + spinner
+ */
+@Composable
+private fun AICoreStatusBadge(statusCode: Int, provisioning: Boolean) {
+    val (label, bg, fg, leading) = when (statusCode) {
+        AICoreEngine.STATUS_AVAILABLE -> Quad(
+            "Ready",
+            Color(0xFF1B5E20),                // dark green container
+            Color(0xFFB9F6CA),                // light green text
+            BadgeIcon.Check,
+        )
+        AICoreEngine.STATUS_DOWNLOADABLE -> Quad(
+            if (provisioning) "Provisioning…" else "Tap to download",
+            Color(0xFF8D6E00),                // amber container
+            Color(0xFFFFECB3),                // amber text
+            if (provisioning) BadgeIcon.Spinner else BadgeIcon.Cloud,
+        )
+        AICoreEngine.STATUS_DOWNLOADING -> Quad(
+            "Downloading…",
+            Color(0xFF8D6E00),
+            Color(0xFFFFECB3),
+            BadgeIcon.Spinner,
+        )
+        AICoreEngine.STATUS_UNAVAILABLE -> Quad(
+            "Not available on this device",
+            Color(0xFF7F1D1D),
+            Color(0xFFFFCDD2),
+            BadgeIcon.Error,
+        )
+        AICORE_PROBE_NOT_INSTALLED -> Quad(
+            "AICore not installed",
+            Color(0xFF7F1D1D),
+            Color(0xFFFFCDD2),
+            BadgeIcon.Error,
+        )
+        else /* AICORE_PROBE_PENDING or unknown */ -> Quad(
+            "Checking…",
+            Color(0xFF424242),                // muted neutral container
+            Color(0xFFE0E0E0),
+            BadgeIcon.Spinner,
+        )
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .background(bg, RoundedCornerShape(999.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        when (leading) {
+            BadgeIcon.Check -> Icon(Icons.Outlined.CheckCircle, null, Modifier.size(14.dp), tint = fg)
+            BadgeIcon.Cloud -> Icon(Icons.Outlined.CloudDownload, null, Modifier.size(14.dp), tint = fg)
+            BadgeIcon.Error -> Icon(Icons.Outlined.ErrorOutline, null, Modifier.size(14.dp), tint = fg)
+            BadgeIcon.Warn -> Icon(Icons.Outlined.WarningAmber, null, Modifier.size(14.dp), tint = fg)
+            BadgeIcon.Spinner -> CircularProgressIndicator(
+                modifier = Modifier.size(12.dp),
+                strokeWidth = 1.5.dp,
+                color = fg,
+            )
+        }
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = fg,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+private enum class BadgeIcon { Check, Cloud, Error, Warn, Spinner }
+/** Tuple for AICore badge styling — destructured at the call site. */
+private data class Quad(
+    val label: String,
+    val background: Color,
+    val foreground: Color,
+    val icon: BadgeIcon,
+)
+
+private fun aicoreSubtext(statusCode: Int): String = when (statusCode) {
+    AICoreEngine.STATUS_AVAILABLE ->
+        "Provided by the Android system service. Inference runs on AICore's chosen backend (NPU / GPU / CPU) — no .litertlm file on disk."
+    AICoreEngine.STATUS_DOWNLOADABLE ->
+        "AICore is installed but Gemini Nano weights aren't on this device yet. Tap below to provision — the download is handled by the system and can take several minutes on the first run."
+    AICoreEngine.STATUS_DOWNLOADING ->
+        "AICore is currently downloading Gemini Nano in the background. This screen will update when it reports Available."
+    AICoreEngine.STATUS_UNAVAILABLE ->
+        "Requires Pixel 8+ with the AICore Developer Preview enrolled, or an OEM build that ships the AICore system service."
+    AICORE_PROBE_NOT_INSTALLED ->
+        "The AICore system service was not detected. Install it from Play Store / OEM channels, or use a built-in LiteRT-LM model from the list below."
+    else /* PROBE_PENDING */ ->
+        "Probing AICore status — this typically takes under a second."
 }
