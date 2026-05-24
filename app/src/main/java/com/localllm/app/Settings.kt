@@ -42,52 +42,11 @@ object Settings {
     const val KEY_IDLE_EVICT_MS = "idle_evict_ms"
     const val KEY_IDLE_STOP_MS = "idle_stop_ms"
 
-    // Inference backend: "AUTO" tries NPU → GPU → CPU and transparently falls
-    // back when each fails (see LLMServerService.getOrCreateEngine). "CPU",
-    // "GPU", "NPU" force a backend strictly with no fallback so init errors
-    // surface to the user.
-    //
-    // LiteRT-LM uses "NPU" as the umbrella for all neural accelerators —
-    // Qualcomm Hexagon, MediaTek APU, and Google's Edge TPU on Tensor — so
-    // there is no separate "TPU" option. NPU init only succeeds when the
-    // vendor delegate .so is present in the app's nativeLibraryDir; the
-    // stock LiteRT-LM 0.11.0 AAR ships only CPU + GPU (OpenCL) delegates,
-    // so on a plain Pixel-class device NPU will fail at init and (under
-    // AUTO) fall through to GPU. We still expose the pill because vendor
-    // delegate drops + custom AAR variants are a real distribution model.
-    const val KEY_BACKEND = "backend"
-    const val BACKEND_AUTO = "AUTO"
-    const val BACKEND_CPU = "CPU"
-    const val BACKEND_GPU = "GPU"
-    const val BACKEND_NPU = "NPU"
-
-    /**
-     * Heuristic: returns true if a vendor NPU/TPU delegate .so appears to be
-     * available in the app's nativeLibraryDir. Used by the Settings UI to
-     * disable the NPU pill on devices where it would just fail at init.
-     *
-     * Conservative on purpose — we match a handful of well-known names
-     * (Qualcomm Hexagon, MediaTek APU, LiteRT-LM's own NPU shim). Anyone
-     * shipping a custom delegate under a different name can still pick NPU
-     * manually and surface the actual error in /health.
-     */
-    fun hasNpuDelegate(context: Context): Boolean {
-        val dir = context.applicationInfo.nativeLibraryDir ?: return false
-        val files = java.io.File(dir).listFiles() ?: return false
-        return files.any { f ->
-            val n = f.name.lowercase()
-            n.contains("npu") ||
-            n.contains("hexagon") ||
-            n.startsWith("libqnn") ||
-            n.contains("neuron") ||
-            n.startsWith("libapu") ||
-            // LiteRT NPU dispatch libs (publicly released via
-            // github.com/google-ai-edge/LiteRT/releases v2.1.1).
-            // The Tensor variant ships as libLiteRtDispatch_GoogleTensor.so;
-            // Qualcomm and MediaTek follow the same naming.
-            n.startsWith("liblitertdispatch_")
-        }
-    }
+    // The currently-selected model id (persisted across launches). The chat
+    // handler also uses this as the fallback when a `/v1/chat/completions`
+    // request omits the `model` field. Defaults to AICore (Gemini Nano).
+    const val KEY_SELECTED_MODEL_ID = "selected_model_id"
+    const val DEFAULT_MODEL_ID = "gemini-nano-aicore"
 
     // CORS: when off (default) the server responds without CORS headers — safe
     // because only non-browser clients (native apps, curl) can use it. When on,
@@ -186,8 +145,9 @@ object Settings {
     fun idleStopMs(context: Context): Long = repo(context).idleStopMs.value
     fun setIdleStopMs(context: Context, value: Long) = repo(context).setIdleStopMs(value)
 
-    fun backend(context: Context): String = repo(context).backend.value
-    fun setBackend(context: Context, value: String) = repo(context).setBackend(value)
+    fun selectedModelId(context: Context): String = repo(context).selectedModelId.value
+    fun setSelectedModelId(context: Context, value: String) =
+        repo(context).setSelectedModelId(value)
 
     fun allowCors(context: Context): Boolean = repo(context).allowCors.value
     fun setAllowCors(context: Context, value: Boolean) = repo(context).setAllowCors(value)

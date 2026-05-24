@@ -2,7 +2,6 @@ package com.localllm.app.ui
 
 import android.content.Context
 import android.os.Build
-import android.text.Html
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.BorderStroke
@@ -60,14 +59,12 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -107,7 +104,6 @@ fun SettingsTab(
     val keepAwake by repo.keepAwake.collectAsState()
     val idleEvictMs by repo.idleEvictMs.collectAsState()
     val idleStopMs by repo.idleStopMs.collectAsState()
-    val backend by repo.backend.collectAsState()
     val allowCors by repo.allowCors.collectAsState()
 
     // For text fields whose user-facing value is a string buffer separate from
@@ -250,18 +246,11 @@ fun SettingsTab(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
-            Text(
-                stringResource(R.string.settings_backend),
-                style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.padding(top = 4.dp),
-            )
-            BackendSelector(
-                selected = backend,
-                onSelect = { repo.setBackend(it) }
-            )
-            // Three-line legend.
-            BackendLegend(selected = backend)
-            HintText(stringResource(R.string.settings_backend_hint))
+            // Backend is now declared per-model in the catalog (see
+            // ModelCatalog.kt — Backend.AICORE / LITERT_CPU / LITERT_GPU /
+            // LITERT_NPU). The server picks the right engine from the
+            // selected model's metadata; there is no longer a global
+            // backend pill or AUTO fallback chain.
 
             SettingRowWithHelp(
                 helpText = stringResource(R.string.settings_max_tokens_help),
@@ -559,104 +548,6 @@ private fun NumberField(
         supportingText = supportingText?.let { { Text(it, color = MaterialTheme.colorScheme.error) } },
         modifier = Modifier.fillMaxWidth()
     )
-}
-
-@Composable
-private fun BackendSelector(selected: String, onSelect: (String) -> Unit) {
-    val context = LocalContext.current
-    // Probed once per recomposition — cheap (listFiles on a small dir).
-    val npuAvailable = remember { Settings.hasNpuDelegate(context) }
-    data class Option(val value: String, val label: String, val enabled: Boolean)
-    val options = listOf(
-        Option(Settings.BACKEND_AUTO, stringResource(R.string.settings_backend_auto), true),
-        Option(Settings.BACKEND_CPU, stringResource(R.string.settings_backend_cpu), true),
-        Option(Settings.BACKEND_GPU, stringResource(R.string.settings_backend_gpu), true),
-        Option(Settings.BACKEND_NPU, stringResource(R.string.settings_backend_npu), npuAvailable),
-    )
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        options.forEach { opt ->
-            val isSel = selected == opt.value
-            Button(
-                onClick = { onSelect(opt.value) },
-                enabled = opt.enabled,
-                modifier = Modifier.weight(1f),
-                colors = if (isSel) ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary
-                ) else ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                    contentColor = MaterialTheme.colorScheme.onSurface
-                )
-            ) { Text(opt.label) }
-        }
-    }
-}
-
-@Composable
-private fun BackendLegend(selected: String) {
-    val context = LocalContext.current
-    val npuAvailable = remember { Settings.hasNpuDelegate(context) }
-    Column(
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        LegendLine(
-            text = htmlToAnnotated(stringResource(R.string.settings_backend_desc_auto)),
-            highlighted = selected == Settings.BACKEND_AUTO,
-        )
-        LegendLine(
-            text = htmlToAnnotated(stringResource(R.string.settings_backend_desc_cpu)),
-            highlighted = selected == Settings.BACKEND_CPU,
-        )
-        LegendLine(
-            text = htmlToAnnotated(stringResource(R.string.settings_backend_desc_gpu)),
-            highlighted = selected == Settings.BACKEND_GPU,
-        )
-        // Only surface the NPU/TPU description when the delegate is actually
-        // present — on a stock install the row would just confuse the user.
-        if (npuAvailable) {
-            LegendLine(
-                text = htmlToAnnotated(stringResource(R.string.settings_backend_desc_npu)),
-                highlighted = selected == Settings.BACKEND_NPU,
-            )
-        }
-    }
-}
-
-@Composable
-private fun LegendLine(text: AnnotatedString, highlighted: Boolean) {
-    val container = if (highlighted) {
-        Modifier
-            .fillMaxWidth()
-            .background(
-                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f),
-                RoundedCornerShape(6.dp),
-            )
-            .padding(8.dp)
-    } else {
-        Modifier.fillMaxWidth().padding(8.dp)
-    }
-    Box(modifier = container) {
-        Text(
-            text = text,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-}
-
-@Composable
-private fun htmlToAnnotated(html: String): AnnotatedString {
-    // Parse limited HTML (<b>, <i>, <tt>) into AnnotatedString. Falls back to plain text.
-    val spanned = remember(html) {
-        Html.fromHtml(html, Html.FROM_HTML_MODE_COMPACT)
-    }
-    return remember(spanned) {
-        AnnotatedString.Builder(spanned.toString()).toAnnotatedString()
-    }
 }
 
 @Composable

@@ -18,17 +18,41 @@ class ModelCatalogTest {
     }
 
     @Test
-    fun `every advertised NPU SoC has a human label`() {
+    fun `Gemma 4 entries declare LITERT_CPU backend`() {
+        val ids = listOf("gemma-4-e2b", "gemma-4-e4b")
+        for (id in ids) {
+            val m = AVAILABLE_MODELS.first { it.id == id }
+            assertEquals("$id should be LITERT_CPU", Backend.LITERT_CPU, m.backend)
+        }
+    }
+
+    @Test
+    fun `AICore virtual entry exists and is the only AICORE backend`() {
+        val ai = AVAILABLE_MODELS.first { it.id == "gemini-nano-aicore" }
+        assertEquals(Backend.AICORE, ai.backend)
+        // Virtual: no file on disk, no URL to download.
+        assertEquals("", ai.url)
+        assertEquals("", ai.filename)
+        val aicoreCount = AVAILABLE_MODELS.count { it.backend == Backend.AICORE }
+        assertEquals(1, aicoreCount)
+    }
+
+    @Test
+    fun `every advertised NPU model declares LITERT_NPU backend with a human label`() {
         val npu = AVAILABLE_MODELS.filter { it.requiredSocMarker != null }
-        // 4 Snapdragon + 3 MediaTek per the LiteRT-LM NPU guide.
-        assertEquals(7, npu.size)
+        // 4 Snapdragon + 3 MediaTek + 1 Tensor G5.
+        assertEquals(8, npu.size)
         for (m in npu) {
+            assertEquals("${m.id} should be LITERT_NPU", Backend.LITERT_NPU, m.backend)
             val label = m.npuSocLabel()
             assertNotNull("missing label for ${m.id}", label)
             // SoC marker should appear (uppercase) in the human label so a
-            // power-user can still cross-reference Build.SOC_MODEL.
+            // power-user can still cross-reference Build.SOC_MODEL — except
+            // for laguna which renders as "Tensor G5 (Pixel 10)".
             val marker = m.requiredSocMarker!!.uppercase()
-            assertTrue("label '$label' must contain '$marker'", label!!.contains(marker))
+            if (marker != "LAGUNA") {
+                assertTrue("label '$label' must contain '$marker'", label!!.contains(marker))
+            }
         }
     }
 
@@ -56,11 +80,20 @@ class ModelCatalogTest {
             )
             // The on-disk filename diverges from the upstream filename (we
             // namespace ours with `npu-` for clarity), but the upstream
-            // filename in the URL must still carry the SoC marker.
-            assertTrue(
-                "upstream URL for ${m.id} must reference SoC ${m.requiredSocMarker}",
-                m.url.contains(m.requiredSocMarker!!)
-            )
+            // filename in the URL must still carry the SoC marker. The
+            // Tensor G5 variant is the exception: upstream names it
+            // `Google_Tensor_G5` rather than the codename `laguna`.
+            if (m.requiredSocMarker != "laguna") {
+                assertTrue(
+                    "upstream URL for ${m.id} must reference SoC ${m.requiredSocMarker}",
+                    m.url.contains(m.requiredSocMarker!!)
+                )
+            } else {
+                assertTrue(
+                    "Tensor G5 URL must reference Google_Tensor_G5",
+                    m.url.contains("Google_Tensor_G5")
+                )
+            }
         }
     }
 }
