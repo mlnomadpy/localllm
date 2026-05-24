@@ -44,22 +44,36 @@ On Android 13+ the app asks for `POST_NOTIFICATIONS` on first launch
 — grant it, otherwise the foreground service notification (and the
 **Stop** action on it) won't show.
 
-## Download a model
+## Pick a model
 
-Open the **Catalog** tab and tap **Download** on either *Gemma 4 E2B
-IT* (2.6 GB, faster) or *Gemma 4 E4B IT* (~4 GB, more accurate).
+You have two paths:
+
+**AICore (Gemini Nano).** No download. Use the magic model id
+`gemini-nano-aicore`. Requires Pixel 8+ with the AICore Developer
+Preview enrolled. On Pixel 10 Pro XL (mustang) it works end-to-end;
+on Pixel 10 Frankel (`53061FDCR000XR`) AICore is installed but Gemini
+Nano feature 646 isn't provisioned yet (`ErrorCode 606 FEATURE_NOT_FOUND`).
+**Keep LocalLLM in the foreground** while a request is in flight or
+AICore returns ErrorCode 30 ("Background usage is blocked").
+
+**LiteRT-LM.** Open the **Catalog** tab and tap **Download** on either
+*Gemma 4 E2B IT* (2.6 GB, faster) or *Gemma 4 E4B IT* (~4 GB, more
+accurate). The catalog also lists the eight NPU-compiled Gemma 3 1B
+variants — one per SoC (Qualcomm SM8550/8650/8750/8850, MediaTek
+MT6989/6991/6993, Google Tensor G5). The catalog badges the variant
+that matches your device's `Build.SOC_MODEL`.
 
 ![Catalog tab](screenshots/catalog.png){ width=350 }
 
 The download runs via Android's `DownloadManager` and is verified
 against the catalog's SHA-256 once it finishes. A mismatched download
-is deleted automatically and you'll see a toast.
+is deleted automatically and you'll see a toast. (NPU variants
+currently ship without a hash — verified opportunistically as users
+report successful runs.)
 
-For custom models (any `.litertlm` bundle, including the Qualcomm-NPU
-variants in the same HuggingFace repo), use **Settings → Custom model
-URLs**, one URL per line, ending in `.litertlm`. They show up in the
-Catalog tab and bypass SHA-256 verification (bring-your-own
-integrity).
+For custom models, use **Settings → Custom model URLs**, one URL per
+line, ending in `.litertlm`. They show up in the Catalog tab and
+bypass SHA-256 verification (bring-your-own integrity).
 
 ## Talk to the server
 
@@ -165,15 +179,22 @@ curl -s http://localhost:8099/health | jq
   "engines": [
     {
       "key": "gemma-4-e2b_model_AUTO",
-      "backend": "CPU"
+      "backend": "CPU",
+      "attempts": [
+        {"backend": "NPU", "result": "failed: TF_LITE_AUX not found in the model", "duration_ms": 5394},
+        {"backend": "GPU", "result": "skipped: known SIGSEGV on Tensor", "duration_ms": 0},
+        {"backend": "CPU", "result": "ok", "duration_ms": 3168}
+      ]
     }
   ]
 }
 ```
 
-`engines[].backend` is the *real* backend the engine ended up on. If
-you've set AUTO and you see `"CPU"` here, GPU init failed silently on
-this device (most often: `libvndksupport.so` missing). The Console tab
-has the GPU failure reason logged.
+`engines[].backend` is the *real* backend that initialized.
+`engines[].attempts` is the full chain — NPU → GPU → CPU for AUTO —
+with the outcome and duration of each step. AICore requests don't
+appear here; they run inside the AICore system service and don't go
+through the LiteRT engine cache. To verify AICore, send a request to
+`gemini-nano-aicore` and watch the **Console** tab.
 
 Next up: [the full HTTP API surface](api.md).

@@ -220,15 +220,73 @@ object RequestTracker {
      * Hot-path: called once per streamed chunk. Lock-free; only updates [_current].
      * If [id] doesn't match the current request (shouldn't happen since inference
      * is serialized), it's silently dropped.
+     *
+     * For streaming responses prefer [accumulatorFor], which batches multiple
+     * chunks into one [Entry.copy] to keep allocation off the per-token path.
+     * This non-batching variant is retained for the non-streaming code paths
+     * and tests that record a single final chunk.
      */
     fun recordChunk(id: String, chunkText: String) {
+        recordChunkBatch(id, chunks = 1, chars = chunkText.length)
+    }
+
+    /**
+     * Bulk version of [recordChunk]. Adds [chunks] events totalling [chars]
+     * output characters to the current request. One [Entry.copy] regardless
+     * of batch size.
+     */
+    fun recordChunkBatch(id: String, chunks: Int, chars: Int) {
+        if (chunks <= 0 && chars <= 0) return
         _current.update { cur ->
             if (cur != null && cur.id == id) {
                 cur.copy(
-                    chunkCount = cur.chunkCount + 1,
-                    outputChars = cur.outputChars + chunkText.length
+                    chunkCount = cur.chunkCount + chunks,
+                    outputChars = cur.outputChars + chars,
                 )
             } else cur
+        }
+    }
+
+    /**
+     * Build a batching accumulator scoped to one streaming request.
+     *
+     * The route calls [ChunkAccumulator.add] once per token (cheap — atomic
+     * counters only) and [ChunkAccumulator.flush] when it's time to push the
+     * UI a fresh snapshot. The accumulator self-flushes when its buffered
+     * chunk count crosses [flushEveryChunks] *or* its accumulated wall time
+     * crosses [flushEveryMs] — whichever comes first. The final [flush]
+     * (typically in a `finally` block) guarantees the last partial batch
+     * lands on the flow.
+     */
+    fun accumulatorFor(
+        id: String,
+        flushEveryChunks: Int = 16,
+        flushEveryMs: Long = 100L,
+    ): ChunkAccumulator = ChunkAccumulator(id, flushEveryChunks, flushEveryMs)
+
+    class ChunkAccumulator internal constructor(
+        private val id: String,
+        private val flushEveryChunks: Int,
+        private val flushEveryMs: Long,
+    ) {
+        private var pendingChunks: Int = 0
+        private var pendingChars: Int = 0
+        private var lastFlushNanos: Long = System.nanoTime()
+
+        fun add(deltaChars: Int) {
+            pendingChunks += 1
+            pendingChars += deltaChars
+            if (pendingChunks >= flushEveryChunks) { flush(); return }
+            val elapsedMs = (System.nanoTime() - lastFlushNanos) / 1_000_000L
+            if (elapsedMs >= flushEveryMs) flush()
+        }
+
+        fun flush() {
+            if (pendingChunks == 0 && pendingChars == 0) return
+            recordChunkBatch(id, pendingChunks, pendingChars)
+            pendingChunks = 0
+            pendingChars = 0
+            lastFlushNanos = System.nanoTime()
         }
     }
 

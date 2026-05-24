@@ -1,14 +1,18 @@
 # HTTP API
 
-The server exposes three endpoints. Everything except `/health` is
-gated by the optional API key configured in **Settings → API key**.
-When the key is empty (the default), all endpoints are open.
+Everything except `/health` is gated by the optional API key configured
+in **Settings → API key**. When the key is empty (the default), all
+endpoints are open.
 
 | Path | Auth | Notes |
 |---|---|---|
-| [`GET /health`](#health) | always open | Liveness + which backend each cached engine ended up on. |
-| [`GET /v1/models`](#models) | optional bearer | Lists `.litertlm` files on disk. |
-| [`POST /v1/chat/completions`](#chat-completions) | optional bearer | OpenAI-style. Streaming or blocking. |
+| [`GET /health`](#health) | always open | Liveness + LiteRT engine attempt chain. |
+| [`GET /v1/models`](#models) | optional bearer | Lists `.litertlm` files, ONNX embedding models, and the virtual `gemini-nano-aicore` entry. |
+| [`POST /v1/chat/completions`](#chat-completions) | optional bearer | OpenAI-style. Routes to AICore for `gemini-nano-aicore`, otherwise to LiteRT-LM. |
+| `POST /v1/embeddings` | optional bearer | ONNX-backed embeddings. |
+| `POST /v1/documents` · `GET /v1/documents` · `DELETE /v1/documents/{id}` | optional bearer | RAG document store (ObjectBox HNSW, dim 384). |
+| `POST /v1/search` | optional bearer | Top-K vector search. |
+| `GET /v1/tenants` · `DELETE /v1/tenants/{tenantId}` | optional bearer | Tenant isolation. |
 
 ## `GET /health` { #health }
 
@@ -26,22 +30,40 @@ curl -s http://localhost:8099/health
   "queue_depth": 0,
   "engines_loaded": 1,
   "engines": [
-    { "key": "gemma-4-e2b_model_AUTO", "backend": "CPU" }
+    {
+      "key": "gemma-4-e2b_model_AUTO",
+      "backend": "CPU",
+      "attempts": [
+        {"backend": "NPU", "result": "failed: TF_LITE_AUX not found in the model", "duration_ms": 5394},
+        {"backend": "GPU", "result": "skipped: known SIGSEGV on Tensor", "duration_ms": 0},
+        {"backend": "CPU", "result": "ok", "duration_ms": 3168}
+      ]
+    }
   ]
 }
 ```
 
 - `queue_depth` — requests currently queued behind the inference
   mutex.
-- `engines_loaded` — count of engines in the LRU cache.
+- `engines_loaded` — LiteRT engines in the LRU cache. AICore requests
+  do **not** appear here; they run inside the AICore system service.
 - `engines[].key` — engine cache key in the shape
   `<model>_<maxTokens|"model">_<backend>`.
-- `engines[].backend` — the backend the engine actually initialized
-  on, after the AUTO fallback resolved. Either `"CPU"` or `"GPU"`.
+- `engines[].backend` — the backend declared for this model in the
+  catalog (`LITERT_CPU`, `LITERT_GPU`, or `LITERT_NPU`). Each engine
+  records the single init attempt that built it; no AUTO chain.
+- `engines[].attempts` — the init record for the declared backend with
+  `result` (`ok` / `failed: …`) and `duration_ms`. Single entry now —
+  the AUTO chain was removed.
+- `aicore` — readiness of Gemini Nano: `{status_code, status,
+  model_id, is_default: true}`. On a device where the AICore probe
+  throws (e.g. service not installed), `status_code` is `null` and
+  `error` carries the SDK message.
 
 ## `GET /v1/models` { #models }
 
-Lists `.litertlm` files currently on disk.
+Lists `.litertlm` LLMs on disk, ONNX embedding models (with a
+sibling `*-vocab.txt`), and the always-present virtual AICore entry.
 
 ```bash
 curl -s -H "Authorization: Bearer $LLM_KEY" \
@@ -52,22 +74,35 @@ curl -s -H "Authorization: Bearer $LLM_KEY" \
 {
   "object": "list",
   "data": [
-    {
-      "id": "gemma-4-e2b",
-      "object": "model",
-      "created": 1778610084,
-      "owned_by": "local"
-    }
+    { "id": "gemma-4-e2b",         "object": "model", "created": 1778610084, "owned_by": "local" },
+    { "id": "gemini-nano-aicore",  "object": "model", "created": 1778610090, "owned_by": "google-aicore" }
   ]
 }
 ```
 
-`id` is the filename with `.litertlm` stripped. Use it in the `model`
-field of chat-completion requests.
+For LiteRT-LM entries, `id` is the filename with `.litertlm` stripped.
+The `gemini-nano-aicore` entry is listed unconditionally so clients
+can probe; the chat handler surfaces a clean error if AICore isn't
+installed or the model isn't downloaded yet.
 
 ## `POST /v1/chat/completions` { #chat-completions }
 
 OpenAI-compatible chat completion. Streaming and blocking.
+
+**Routing.** When `model == "gemini-nano-aicore"` the request bypasses
+the LiteRT engine cache and the inference mutex — AICore runs inside
+the system service and handles its own serialization. Every other
+model id is resolved against `.litertlm` files on disk and goes
+through the LiteRT-LM path. The two paths differ in three places that
+clients should know about:
+
+| | AICore (`gemini-nano-aicore`) | LiteRT-LM (e.g. `gemma-4-e2b`) |
+|---|---|---|
+| Backend selection | Decided by AICore. No surface. | Declared per-model in the catalog (`Backend.LITERT_CPU` / `_GPU` / `_NPU`). No fallback chain. |
+| `session_id` (KV reuse) | Ignored. Stateless. History is flattened into one prompt. | Honored — see [multi-turn](#multi-turn-with-session_id). |
+| App lifecycle constraint | **Foreground only.** Backgrounded calls fail with ErrorCode 30. | None. |
+| `tools` / `tool_choice` | Not supported by the SDK. | Honored. |
+| Multimodal `content` parts | Text only. | Text + `image_url` parts. |
 
 ### Request
 

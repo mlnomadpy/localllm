@@ -2,6 +2,7 @@ package com.localllm.app
 
 import android.app.Application
 import android.os.StrictMode
+import com.localllm.app.warmup.WarmupWorker
 
 /**
  * Single Application entry point. Installs a global uncaught exception logger
@@ -53,6 +54,21 @@ class LocalLLMApplication : Application() {
         }
 
         LogManager.i("App", "LocalLLM v${BuildConfig.VERSION_NAME} starting")
+
+        // The background warm-up job opened its own engine and could leave the
+        // native LiteRT runtime in a contested state vs the foreground service
+        // (status 13 - "failed to invoke compiled model" on the next service
+        // request). The fix is in WarmupWorker.doWork (skip when service is up
+        // + close its registry in finally). We do NOT re-schedule it from app
+        // start: warm-up is an optimisation, and we'd rather have reliable
+        // chat than a 2-3s first-token improvement.
+        // To re-enable cleanly we need a process-wide EngineRegistry instead
+        // of one-per-component.
+        try {
+            WarmupWorker.cancel(this)
+        } catch (t: Throwable) {
+            LogManager.w("App", "Failed to cancel WarmupWorker: ${t.message}")
+        }
     }
 
     /**

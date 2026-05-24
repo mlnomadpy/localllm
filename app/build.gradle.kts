@@ -123,6 +123,11 @@ dependencies {
     // Async, Flow-native settings persistence (replaces SharedPreferences)
     implementation(libs.androidx.datastore.preferences)
 
+    // WorkManager — drives the periodic background warm-up job that
+    // pre-loads the selected engine while the device is idle so the first
+    // user request after a long pause doesn't pay the full engine-init cost.
+    implementation(libs.androidx.work.runtime.ktx)
+
     // ObjectBox on-device vector store. Backs the /v1/documents + /v1/search
     // endpoints with an HNSW-indexed embedding column for sub-millisecond kNN.
     implementation(libs.objectbox.android)
@@ -154,6 +159,12 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.core)
+    testImplementation(libs.ktor.server.test.host)
+    testImplementation(libs.ktor.client.content.negotiation)
+    testImplementation(libs.androidx.work.testing)
+    testImplementation(libs.mockito.kotlin)
+    testImplementation(libs.mockito.core)
+    testImplementation(libs.turbine)
 
     // R8 consumes the profile produced by the :macrobenchmark module to
     // AOT-compile the hot startup paths in release builds.

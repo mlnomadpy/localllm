@@ -50,7 +50,10 @@ Runtime versions are all locked in `gradle/libs.versions.toml`:
 | AGP | 8.7.3 |
 | Ktor | 3.4.3 |
 | Compose BOM | 2024.09.02 |
-| LiteRT-LM | 0.11.0 |
+| LiteRT-LM | 0.12.0 |
+| ML Kit GenAI Prompt | 1.0.0-beta2 |
+| ONNX Runtime Android | 1.18.0 |
+| ObjectBox | 4.0.3 |
 
 ## Adding a model to the catalog
 
@@ -88,20 +91,32 @@ post-2022 should manage 10–30 tok/s on CPU.
 Tested on Pixel-class devices. NPU acceleration via the Qualcomm
 `.litertlm` variants requires a Snapdragon device.
 
-## GPU vs CPU on your device
+## Picking a backend on your device
 
-The AUTO backend tries GPU first and falls back to CPU on any
-`Engine.initialize()` failure. The most common GPU failure on stock
-Pixel images is `dlopen failed: library libvndksupport.so not found`
-— Google ships `libvndksupport.so` on some images but not others. If
-you see this and want to force CPU explicitly (skip the failed GPU
-attempt), set **Settings → Backend → CPU**.
+LiteRT-LM AUTO tries **NPU → GPU → CPU** and records every step. The
+NPU attempt is only meaningful when the device has a vendor delegate
+reachable from `nativeLibraryDir` (QAIRT, NeuroPilot) or, on Pixel
+6/9/10, the bundled `libLiteRtDispatch_GoogleTensor.so`. The most
+common GPU failure on stock Pixel images is `dlopen failed: library
+libvndksupport.so not found`. Force a specific backend in **Settings
+→ Backend** if you want to skip the chain.
 
-To see what your device picked, `curl /health`:
+AICore (`gemini-nano-aicore`) doesn't expose a backend selector —
+the AICore system service picks NPU/GPU/CPU internally.
+
+To see what your LiteRT engine picked, `curl /health`:
 
 ```bash
-curl -s http://localhost:8099/health | jq '.engines'
-# [{"key":"gemma-4-e2b_model_AUTO","backend":"CPU"}]
+curl -s http://localhost:8099/health | jq '.engines[0]'
+# {
+#   "key": "gemma-4-e2b_model_AUTO",
+#   "backend": "CPU",
+#   "attempts": [
+#     {"backend":"NPU","result":"failed: TF_LITE_AUX not found in the model","duration_ms":5394},
+#     {"backend":"GPU","result":"skipped: known SIGSEGV on Tensor","duration_ms":0},
+#     {"backend":"CPU","result":"ok","duration_ms":3168}
+#   ]
+# }
 ```
 
 ## Tests
@@ -315,7 +330,7 @@ Only `lib/arm64-v8a/...` entries should appear in the per-ABI APK.
 
 ### LiteRT-LM ABI gotcha
 
-The `com.google.ai.edge.litertlm:litertlm-android:0.11.0` AAR ships
+The `com.google.ai.edge.litertlm:litertlm-android:0.12.0` AAR ships
 JNI `.so` files for **`arm64-v8a` and `x86_64` only**:
 
 - `lib/arm64-v8a/`: `libLiteRt.so`, `libLiteRtClGlAccelerator.so`,
@@ -333,14 +348,33 @@ the universal APK works for smoke tests.
 ## Roadmap
 
 Tracked in [GitHub Issues](https://github.com/mlnomadpy/localllm/issues).
-Big items:
 
-- [ ] Multimodal content blocks (`Content.ImageBytes` /
-      `Content.AudioBytes`) — LiteRT-LM already supports them.
-- [ ] Tool / function calling (`ConversationConfig.tools`).
-- [ ] Qualcomm NPU catalog entries
-      (`gemma-4-E2B-it_qualcomm_sm8750.litertlm`).
-- [ ] Per-IP token-bucket rate limiting.
+**Shipped this cycle**
+
+- AICore (Gemini Nano) as the default engine (`Settings.DEFAULT_MODEL_ID
+  = "gemini-nano-aicore"`).
+- AUTO backend chain removed — `Backend` enum declared per-model in the
+  catalog; no fallback.
+- Feature-sliced split of `LLMServerService.kt` (2287 → ~366 lines).
+  Routes under `server/routes/`, engines under `inference/litert/` and
+  `inference/aicore/`.
+- Structured error envelopes (`RichErrorResponse` / `RichErrorDetails`):
+  `AICORE_DOWNLOADABLE`, `AICORE_DOWNLOADING`, `AICORE_UNAVAILABLE`,
+  `AICORE_BACKGROUND_BLOCKED`, `AICORE_RUNTIME_ERROR`,
+  `LITERT_INIT_FAILED`.
+- `GET /v1/aicore/status` and `POST/GET /v1/aicore/benchmark` (TTFT,
+  tok/s, total-ms).
+- `aicore` block in `/health`.
+- Multimodal `image_url` content blocks (LiteRT path).
+- Tool / function calling.
+- Qualcomm + MediaTek + Tensor G5 NPU catalog entries.
+- Release signing + R8 production build.
+
+**Open**
+
+- [ ] `Content.AudioBytes` multimodal input (LiteRT-LM supports it; the
+      OpenAI-compat layer doesn't yet).
+- [ ] Per-IP token-bucket rate limiting (currently per-User-Agent).
 - [ ] Persistent log buffer + Sentry/Crashlytics integration.
 - [ ] `androidTest` end-to-end with a tiny fixture model.
-- [ ] Release signing + R8 production build.
+- [ ] Multi-process isolation for engine crashes (issue #11).

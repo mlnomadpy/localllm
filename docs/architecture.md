@@ -1,11 +1,30 @@
 # Architecture
 
 The app is one Gradle module — `:app` — containing both the Compose
-UI and the foreground Service that hosts the inference engine and HTTP
-server. Everything is laid out flat under `com.localllm.app`. The line
-between "UI" and "service" is hard: the service is process-global state
-(LRU caches, queue, request tracker), and the UI observes it via
-`StateFlow`.
+UI and the foreground Service that hosts two inference engines (AICore
++ LiteRT-LM) and the HTTP server. The source is feature-sliced under
+`com.localllm.app`:
+
+- `server/` — Ktor lifecycle, `ServerEngine`, `ServerDeps`,
+  `RouteSupport`, and `server/auth/Authorize` for the bearer check.
+- `server/routes/` — one file per HTTP route group:
+  `HealthRoute`, `ModelsRoute`, `ChatRoute`, `EmbeddingsRoute`,
+  `DocumentsRoute`, `AICoreRoute`, `BenchmarkRoute`.
+- `inference/` — engine abstraction: `Engine`, `EngineRegistry`
+  (catalog-driven, no AUTO chain), `EmbeddingRegistry`,
+  `AiCoreNotReadyException`.
+- `inference/litert/` — `LiteRtEngine`, `LiteRtEngineBuilder`,
+  `TensorSoCDetector`, `LlmMessageConverter`, `SessionManager`.
+- `inference/aicore/` — `AICoreEngine`, `AICoreEngineAdapter`,
+  `AICoreBenchmark`.
+- `embedding/` — ONNX Runtime + WordPiece.
+- `rag/` — ObjectBox vector store, document chunker, tenant resolver.
+- `LLMServerService.kt` — the `Service` itself, ~366 lines of
+  lifecycle glue. (It was 2287 lines before the feature-sliced split.)
+
+The line between "UI" and "service" is hard: the service is process-
+global state (LRU caches, queue, request tracker), and the UI
+observes it via `StateFlow`.
 
 ## Components at a glance
 
@@ -53,6 +72,25 @@ between "UI" and "service" is hard: the service is process-global state
 
 ## Inference path
 
+There are two paths through `/v1/chat/completions`. The router
+branches on `req.model` very early:
+
+- **AICore path** (`req.model == "gemini-nano-aicore"`): no engine
+  cache lookup, no `inferenceMutex`, no wake lock — AICore runs in
+  the system service and handles its own serialization. The handler
+  calls `AICoreEngine.checkStatusCode()` first; if the status isn't
+  `STATUS_AVAILABLE` the request fails with a structured error.
+  Otherwise the chat history is flattened (`flattenForAICore`) into a
+  single `system: …\n\nuser: …\n\nassistant:` prompt and handed to
+  `AICoreEngine.complete(...)` or `AICoreEngine.stream(...)`, both
+  wrapped in `withTimeout(timeoutMs)`. **AICore requires the host
+  app to be in the foreground** — backgrounded calls fail with
+  ErrorCode 30 from the SDK.
+- **LiteRT-LM path** (every other model id): the rest of this
+  section.
+
+### LiteRT-LM path
+
 A request through `/v1/chat/completions` goes through:
 
 1. **Body size guard** — `Content-Length` cap; fail fast with `413`.
@@ -67,11 +105,13 @@ A request through `/v1/chat/completions` goes through:
       backend)`, which constructs an `EngineConfig` and calls
       `Engine.initialize()` (the blocking part — several seconds on a
       cold load).
-    - **AUTO** path: try GPU; on `engine.initialize()` exception, log
-      a warning and rebuild on CPU. The cached entry records the
-      backend that actually succeeded.
-    - **Explicit CPU / GPU**: no fallback. Surface failures so users
-      can debug.
+    - **AUTO** path: try NPU → GPU → CPU. Every attempt is recorded
+      with its result (`ok` / `failed: …` / `skipped: …`) and
+      `duration_ms`; the first success wins and is cached. On Tensor
+      SoCs, AUTO inserts a one-shot `NPU-primer` call before the real
+      CPU attempt to unblock a known cold-init bug.
+    - **Explicit CPU / GPU / NPU**: no fallback. Surface failures so
+      users can debug. Errors include the attempts summary inline.
 5. **Conversation resolution** — `resolveSession(req, handle,
    temperature, topK)`:
     - Stateless (empty `session_id`): build a fresh `Conversation`
@@ -176,27 +216,69 @@ already disconnected.
 
 ```
 app/src/main/java/com/localllm/app/
-├── ApiTypes.kt              OpenAI wire types (Gson @SerializedName)
+├── ApiTypes.kt              OpenAI wire types + RichErrorResponse / RichErrorDetails
 ├── BootReceiver.kt          autostart on device boot
-├── LLMServerService.kt      foreground service: Ktor + LiteRT-LM engine + caches
+├── LLMServerService.kt      foreground service: lifecycle, FGS notification, wiring (~366 lines)
 ├── LocalLLMApplication.kt   Application subclass
 ├── LogManager.kt            in-memory log ring buffer + Android Log
 ├── MainActivity.kt          Compose root, tab routing, file picker, download poll
-├── ModelCatalog.kt          AVAILABLE_MODELS list + ModelInfo with sha256
-├── RequestTracker.kt        atomic queue + history + stats StateFlow
-├── Settings.kt              SharedPreferences-backed facade
+├── MessageHelpers.kt        pure JVM-testable helpers
+├── ModelCatalog.kt          AVAILABLE_MODELS + ModelInfo + Backend enum (AICORE/LITERT_CPU/GPU/NPU)
+├── RateLimiter.kt           per-client token bucket
+├── RequestTracker.kt        atomic queue + history + stats StateFlow + client summaries
+├── Settings.kt              DataStore-backed facade (DEFAULT_MODEL_ID = gemini-nano-aicore)
 ├── SettingsRepository.kt    StateFlow-backed observable layer
 ├── Theme.kt                 dark Material 3 color scheme
+├── server/
+│   ├── ServerEngine.kt      Ktor embeddedServer + module wiring
+│   ├── ServerDeps.kt        shared dependency bundle for routes
+│   ├── RouteSupport.kt      tenantFromCall, respondWithTenant
+│   ├── auth/
+│   │   └── Authorize.kt     bearer-token check
+│   └── routes/
+│       ├── HealthRoute.kt        GET /health (with aicore block)
+│       ├── ModelsRoute.kt        GET /v1/models
+│       ├── ChatRoute.kt          POST /v1/chat/completions (structured error envelopes)
+│       ├── EmbeddingsRoute.kt    POST /v1/embeddings
+│       ├── DocumentsRoute.kt     RAG document + search + tenants
+│       ├── AICoreRoute.kt        GET /v1/aicore/status
+│       └── BenchmarkRoute.kt     POST/GET /v1/aicore/benchmark
+├── inference/
+│   ├── Engine.kt                 Engine + TextStreamingEngine interfaces
+│   ├── EngineRegistry.kt         catalog-driven backend dispatch, LRU(2) for LiteRT, no fallback
+│   ├── EmbeddingRegistry.kt      LRU(1) of ONNX embedding services
+│   ├── AiCoreNotReadyException.kt typed exception with SDK status code
+│   ├── litert/
+│   │   ├── LiteRtEngine.kt          Engine wrapper around native LiteRT engine
+│   │   ├── LiteRtEngineBuilder.kt   builds engines on catalog-declared backend
+│   │   ├── TensorSoCDetector.kt     Tensor codename detection (filtering only, not selection)
+│   │   ├── LlmMessageConverter.kt   OpenAI ↔ LiteRT-LM conversion + image fetch
+│   │   └── SessionManager.kt        KV-cache conversation reuse across turns
+│   └── aicore/
+│       ├── AICoreEngine.kt          ML Kit GenAI Prompt API wrapper (gemini-nano-aicore)
+│       ├── AICoreEngineAdapter.kt   TextStreamingEngine implementation
+│       └── AICoreBenchmark.kt       TTFT + tok/s + total-ms speed test
+├── embedding/
+│   ├── EmbeddingService.kt  ONNX Runtime + idle eviction
+│   └── WordPieceTokenizer.kt BERT WordPiece in pure Kotlin
+├── rag/
+│   ├── Chunker.kt           paragraph-aware chunker with sliding-window fallback
+│   ├── DocumentChunk.kt     ObjectBox entity (HNSW-indexed FloatArray)
+│   ├── DocumentStore.kt     ingest / list / delete / search
+│   └── TenantResolver.kt    per-client tenant isolation
 └── ui/
     ├── AppTab.kt            enum + UiMessage data class
-    ├── ChatTab.kt           model dropdown, stop button, live tok/s, system prompt, sendChatMessage
+    ├── ChatBubble.kt / ChatEmptyState.kt / ChatTab.kt
     ├── ConsoleTab.kt        log viewer
-    ├── DashboardTab.kt      live queue / stats / history
-    ├── Header.kt            "LIVE • <url> • Copy URL"
-    ├── ModelsTab.kt         catalog + custom URLs + import
+    ├── DashboardTab.kt      live queue/stats/history + AICore benchmark card
+    ├── DocumentApiClient.kt / DocumentsTab.kt
+    ├── Header.kt            status dot helper
+    ├── MarkdownText.kt      commonmark-backed renderer
+    ├── ModelsTab.kt         catalog + live AICore status card + custom URLs + import
     └── SettingsTab.kt       settings UI, observes SettingsRepository
 ```
 
 Tests live in `app/src/test/java/com/localllm/app/` —
-`SettingsTest.kt` and `RequestTrackerTest.kt`. Run via `./gradlew
-:app:testDebugUnitTest`.
+`SettingsTest.kt`, `RequestTrackerTest.kt`, `ApiTypesTest.kt`,
+`MessageHelpersTest.kt`, `RateLimiterTest.kt`, plus chunker tests
+under `rag/`. Run via `./gradlew :app:testDebugUnitTest`.

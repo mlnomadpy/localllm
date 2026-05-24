@@ -229,6 +229,31 @@ data class ErrorDetails(
     val code: Int
 )
 
+/**
+ * Richer error envelope used by the AICore (Gemini Nano) and LiteRT-LM
+ * failure paths in `/v1/chat/completions`. Extension to the baseline OpenAI
+ * error shape — clients that only know OpenAI still get a readable
+ * `message` / `type`. Clients aware of our extension can branch on [code]
+ * (string like `AICORE_DOWNLOADABLE`, `LITERT_INIT_FAILED`), surface
+ * [aicoreStatus] in the UI, and present [nextSteps] verbatim to the user.
+ *
+ *  - [code]: stable machine-readable identifier (string, not the int HTTP code
+ *    in [ErrorDetails]).
+ *  - [aicoreStatus]: present for AICore-related failures; mirrors
+ *    `AICoreEngine.statusLabel`.
+ *  - [actionable]: true iff [nextSteps] can resolve the failure.
+ */
+data class RichErrorResponse(val error: RichErrorDetails)
+
+data class RichErrorDetails(
+    val message: String,
+    val type: String,
+    val code: String,
+    @SerializedName("aicore_status") val aicoreStatus: String? = null,
+    val actionable: Boolean = false,
+    @SerializedName("next_steps") val nextSteps: List<String> = emptyList(),
+)
+
 data class ModelListResponse(
     val `object`: String = "list",
     val data: List<ModelData>

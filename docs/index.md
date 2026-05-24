@@ -1,10 +1,10 @@
 # LocalLLM Edge Server
 
-**An on-device, OpenAI-compatible LLM HTTP server for Android.** Runs
-[Gemma 4](https://huggingface.co/litert-community) locally on the phone
-via Google's LiteRT-LM runtime, exposes the OpenAI Chat Completions API
-on a configurable port — no cloud, no remote API key, no data leaves
-the device.
+**An on-device, OpenAI-compatible LLM HTTP server for Android.** Two
+engines under one OpenAI Chat Completions API: Google's **AICore (Gemini
+Nano)** via ML Kit GenAI on Pixel-class devices, and any **LiteRT-LM**
+`.litertlm` bundle (Gemma 4 family + the eight NPU-compiled Gemma 3 1B
+SoC variants). No cloud, no remote API key, no data leaves the device.
 
 <div class="grid cards" markdown>
 
@@ -19,15 +19,18 @@ the device.
 
     [:octicons-arrow-right-24: HTTP API](api.md)
 
--   :material-cpu-64-bit:{ .lg .middle } __LiteRT-LM, not MediaPipe__
+-   :material-cpu-64-bit:{ .lg .middle } __Two engines, one API__
 
     ---
 
-    Loads `.litertlm` bundles via
-    `com.google.ai.edge.litertlm:litertlm-android:0.11.0` — Google's
-    successor runtime to MediaPipe `tasks-genai`. AUTO backend tries
-    GPU first, falls back to CPU if the OpenCL/OpenGL delegate can't
-    initialize on the device.
+    **AICore (Gemini Nano)** via `com.google.mlkit:genai-prompt:1.0.0-beta2`
+    is the default — `gemini-nano-aicore` is `Settings.DEFAULT_MODEL_ID`.
+    **LiteRT-LM** (`com.google.ai.edge.litertlm:litertlm-android:0.12.0`)
+    is the alternative for offline weights, custom `.litertlm` bundles, or
+    NPU-compiled SoC variants. Each catalog entry declares its `Backend`
+    (`AICORE` / `LITERT_CPU` / `LITERT_GPU` / `LITERT_NPU`) — no fallback
+    chain. `GET /health` exposes the live AICore status and the cached
+    LiteRT engines.
 
     [:octicons-arrow-right-24: Architecture](architecture.md)
 
@@ -71,31 +74,38 @@ the device.
 # 1. Install
 adb install -r app-debug.apk
 
-# 2. Open the app, tap "Download" on Gemma 4 E2B IT (~2.6 GB)
-#    The server autostarts once a model is on disk.
-
-# 3. Forward the port to your laptop (or use the LAN IP from the app header)
+# 2. Forward the port to your laptop (or use the LAN IP from the app header)
 adb forward tcp:8099 tcp:8099
 
-# 4. Send a request — exactly the same shape as OpenAI's API
+# 3a. AICore (Gemini Nano) — no download, requires a supported Pixel.
+#     Keep the LocalLLM app in the foreground while the request is in
+#     flight (AICore returns ErrorCode 30 if backgrounded).
+curl http://localhost:8099/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-nano-aicore",
+    "messages": [{"role": "user", "content": "Say hi in one word."}]
+  }'
+
+# 3b. Or, after tapping "Download" on Gemma 4 E2B IT (~2.6 GB) in the
+#     Catalog tab, use the LiteRT-LM path — no foreground constraint.
 curl http://localhost:8099/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemma-4-e2b",
     "messages": [{"role": "user", "content": "Say hi in one word."}]
   }'
-# → {"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Hi.","role":"assistant"}}],...}
 ```
 
 ## Why this exists
 
-The MediaPipe `tasks-genai` Android library doesn't ship Gemma 4 support
-— Google split on-device delivery onto LiteRT-LM. This app is the
-glue: takes any `.litertlm` bundle from
-[`litert-community`](https://huggingface.co/litert-community), wraps it
-in the public LiteRT-LM runtime, and exposes it as a local HTTP server
-so every app on the device (or every device on your LAN) can use the
-same model without each one shipping a 2.6 GB binary.
+There's no public Android library that exposes Gemini Nano *and*
+Gemma 4 behind one OpenAI-compatible HTTP surface. AICore is gated
+behind ML Kit GenAI's Prompt API; Gemma 4 ships only as `.litertlm`
+bundles via Google's LiteRT-LM runtime. This app stitches both into
+the same `/v1/chat/completions` endpoint so every app on the device
+(or every device on your LAN) can pick the right engine per request
+without shipping its own copy of either runtime.
 
 It's the same idea as running [Ollama](https://ollama.ai) on a laptop,
 except the daemon runs in your pocket.
