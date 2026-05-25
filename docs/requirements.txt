@@ -1,4 +1,4 @@
 # Pin only what the docs site actually needs. mkdocs-material pulls in
 # mkdocs + pymdown-extensions + pygments transitively.
-mkdocs-material>=9.5,<10
+mkdocs-material>=9.7.6,<10
 pymdown-extensions>=10.7
