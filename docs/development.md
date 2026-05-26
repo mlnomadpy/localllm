@@ -93,28 +93,35 @@ Tested on Pixel-class devices. NPU acceleration via the Qualcomm
 
 ## Picking a backend on your device
 
-LiteRT-LM AUTO tries **NPU → GPU → CPU** and records every step. The
-NPU attempt is only meaningful when the device has a vendor delegate
-reachable from `nativeLibraryDir` (QAIRT, NeuroPilot) or, on Pixel
-6/9/10, the bundled `libLiteRtDispatch_GoogleTensor.so`. The most
-common GPU failure on stock Pixel images is `dlopen failed: library
-libvndksupport.so not found`. Force a specific backend in **Settings
-→ Backend** if you want to skip the chain.
+There is **no AUTO chain**. Each catalog entry declares its
+`Backend` directly (`AICORE` / `LITERT_CPU` / `LITERT_GPU` /
+`LITERT_NPU`) in `ModelCatalog.kt`. Side-loaded models default to
+`LITERT_CPU`.
+
+On Google Tensor SoCs (Pixel 6 / 9 / 10), a one-shot `NPU` *primer*
+runs before a real `LITERT_CPU` / `LITERT_GPU` init. It's expected
+to fail (no vendor delegate on stock hardware) but the JNI side
+effects unblock a known cold-init bug. It's **not** a fallback —
+failure on the declared backend stops there with
+`LITERT_INIT_FAILED`.
+
+NPU variants additionally check `Build.SOC_MODEL` against
+`requiredSocMarker` *before* init, so an SoC mismatch fails fast
+with a clear message instead of a cryptic native error.
 
 AICore (`gemini-nano-aicore`) doesn't expose a backend selector —
 the AICore system service picks NPU/GPU/CPU internally.
 
-To see what your LiteRT engine picked, `curl /health`:
+To see what your engine actually loaded, `curl /health`:
 
 ```bash
-curl -s http://localhost:8099/health | jq '.engines[0]'
+curl -s http://localhost:8080/health | jq '.engines[0]'
 # {
-#   "key": "gemma-4-e2b_model_AUTO",
-#   "backend": "CPU",
+#   "key": "gemma-4-e2b_model_LITERT_CPU",
+#   "backend": "LITERT_CPU",
 #   "attempts": [
-#     {"backend":"NPU","result":"failed: TF_LITE_AUX not found in the model","duration_ms":5394},
-#     {"backend":"GPU","result":"skipped: known SIGSEGV on Tensor","duration_ms":0},
-#     {"backend":"CPU","result":"ok","duration_ms":3168}
+#     {"backend":"NPU-primer","result":"expected-fail: no vendor delegate","duration_ms":312},
+#     {"backend":"LITERT_CPU","result":"ok","duration_ms":3168}
 #   ]
 # }
 ```
@@ -125,17 +132,34 @@ curl -s http://localhost:8099/health | jq '.engines[0]'
 ./gradlew :app:testDebugUnitTest
 ```
 
-Two unit-test files today, both JVM (Robolectric):
+**38 unit-test files**, all JVM-runnable (Robolectric for anything
+that needs `Context`). Grouped roughly:
 
-- `SettingsTest.kt` — preference clamping (`maxTokens`, `temperature`,
-  etc.), `bindHost` derivation, backend normalization.
-- `RequestTrackerTest.kt` — atomic queue cap, stats derivation,
-  cancel/error counters.
+- **Core logic** — `RequestTrackerTest`, `RateLimiterTest`,
+  `RateLimiterEdgeTest`, `LogManagerTest`, `MessageHelpersTest`.
+- **Settings & config** — `SettingsTest`, `SettingsRepositoryTest`.
+- **Wire types** — `ApiTypesTest`, `ApiTypesContentTest`,
+  `TenantApiTypesTest`.
+- **RAG** — `ChunkerTest`, `ChunkerEdgeTest`, `DocumentChunkTest`,
+  `DocumentStoreTest`, `TenantResolverTest`.
+- **Embeddings** — `EmbeddingServiceTest`,
+  `WordPieceTokenizerTest`.
+- **Inference** — `EngineKeyTest`, `AiCoreNotReadyExceptionTest`,
+  `AICoreEngineStatusTest`, `AICoreBenchmarkTokenCountTest`,
+  `TensorSoCDetectorTest`, `LlmMessageConverterTest`.
+- **Model management** — `ModelCatalogTest`,
+  `ModelDirectoryScannerTest`.
+- **Routes (Ktor `testApplication`)** — `HealthRouteTest`,
+  `ModelsRouteTest`, `ChatRouteTest`, `EmbeddingsRouteTest`,
+  `DocumentsRouteTest`, `AICoreRouteTest`, `BenchmarkRouteTest`,
+  `MetricsRouteTest`, `AuthorizeTest`, `RouteSupportTest`,
+  `NsdBroadcasterTest`.
+- **Background** — `WarmupWorkerTest`.
 
-There is **no on-device instrumentation test** today. End-to-end
-verification is a manual `curl` against a real `adb forward`. If you
-add an `androidTest` source set, expect the model fixture to be the
-hard part — a 2.6 GB binary blob doesn't belong in git.
+There is **no on-device instrumentation test** for the LLM path today
+— end-to-end inference is verified manually via `curl` against a real
+`adb forward`. The roadmap entry to fix that exists (`androidTest`
+with a tiny fixture model), tracked in issues.
 
 ## Baseline profiles & macrobenchmark
 

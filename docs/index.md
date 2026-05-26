@@ -3,8 +3,18 @@
 **An on-device, OpenAI-compatible LLM HTTP server for Android.** Two
 engines under one OpenAI Chat Completions API: Google's **AICore (Gemini
 Nano)** via ML Kit GenAI on Pixel-class devices, and any **LiteRT-LM**
-`.litertlm` bundle (Gemma 4 family + the eight NPU-compiled Gemma 3 1B
+`.litertlm` bundle (Gemma 4 family + seven NPU-compiled Gemma 3 1B
 SoC variants). No cloud, no remote API key, no data leaves the device.
+
+!!! tip "Why this exists"
+    Most apps already talk to LLMs over HTTP. The moment you move
+    inference on-device, that contract breaks — every app embeds its
+    own runtime, its own weights, its own engine. Three apps that
+    each want a 2 GB model want 6 GB of RAM and three threads
+    fighting for the same accelerator. This project is the one
+    place on the device where LLMs actually run: apps keep speaking
+    HTTP, the server owns the model lifecycle, queue, KV cache,
+    rate limits, and metrics.
 
 <div class="grid cards" markdown>
 
@@ -64,6 +74,7 @@ SoC variants). No cloud, no remote API key, no data leaves the device.
 ![Catalog tab](screenshots/catalog.png){ width=250 }
 ![Chat tab](screenshots/chat.png){ width=250 }
 ![Dashboard tab](screenshots/dashboard.png){ width=250 }
+![Console tab](screenshots/console.png){ width=250 }
 ![Settings tab](screenshots/settings.png){ width=250 }
 
 </div>
@@ -75,12 +86,12 @@ SoC variants). No cloud, no remote API key, no data leaves the device.
 adb install -r app-debug.apk
 
 # 2. Forward the port to your laptop (or use the LAN IP from the app header)
-adb forward tcp:8099 tcp:8099
+adb forward tcp:8080 tcp:8080
 
 # 3a. AICore (Gemini Nano) — no download, requires a supported Pixel.
 #     Keep the LocalLLM app in the foreground while the request is in
 #     flight (AICore returns ErrorCode 30 if backgrounded).
-curl http://localhost:8099/v1/chat/completions \
+curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemini-nano-aicore",
@@ -89,7 +100,7 @@ curl http://localhost:8099/v1/chat/completions \
 
 # 3b. Or, after tapping "Download" on Gemma 4 E2B IT (~2.6 GB) in the
 #     Catalog tab, use the LiteRT-LM path — no foreground constraint.
-curl http://localhost:8099/v1/chat/completions \
+curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemma-4-e2b",
