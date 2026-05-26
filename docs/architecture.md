@@ -21,6 +21,9 @@ UI and the foreground Service that hosts two inference engines (AICore
 - `rag/` — ObjectBox vector store, document chunker, tenant resolver.
 - `LLMServerService.kt` — the `Service` itself, ~366 lines of
   lifecycle glue. (It was 2287 lines before the feature-sliced split.)
+- `server/routes/MetricsRoute.kt` — Prometheus exposition.
+- `NsdBroadcaster.kt` — mDNS / `android.net.nsd` advertisement
+  (`_localllm._tcp.` with TXT records) when bound to LAN.
 
 The line between "UI" and "service" is hard: the service is process-
 global state (LRU caches, queue, request tracker), and the UI
@@ -138,6 +141,34 @@ A request through `/v1/chat/completions` goes through:
    `invalidateSession()` on failure (drops the entry). Stateless
    conversations are closed in `finally`.
 
+## No fallback chain — enforced top to bottom
+
+The previous AUTO backend chain (NPU → GPU → CPU with primer
+side-effects) is gone. The catalog declaration is the only signal:
+
+1. **`ModelCatalog.kt`** — every entry sets `Backend.AICORE`,
+   `Backend.LITERT_CPU`, `Backend.LITERT_GPU`, or `Backend.LITERT_NPU`.
+   Side-loaded models default to `LITERT_CPU`.
+2. **`EngineRegistry.acquire()`** — simple `when` dispatch. No
+   try-catch-fallback. The declared backend wins or fails loudly.
+3. **`LiteRtEngineBuilder.build()`** — validates the backend, builds
+   one engine, returns it. On Google Tensor SoCs with `LITERT_CPU` or
+   `LITERT_GPU`, runs a one-shot `NPU` *primer* (expected to fail)
+   before the real init — this is a JNI side-effect workaround, not
+   a fallback chain.
+4. **NPU SoC validation** — when `Backend.LITERT_NPU` is declared
+   with a `requiredSocMarker`, `EngineRegistry` checks
+   `Build.SOC_MODEL` *before* init. SoC mismatch fails fast with an
+   actionable message instead of a cryptic native error.
+5. **`ChatRoute`** — engine-acquire failures land in
+   `liteRtAcquireEnvelope()` (LiteRT) or `aicoreNotReadyEnvelope()`
+   (AICore) and surface as a structured `RichErrorResponse` with
+   `code`, `actionable`, `next_steps`.
+
+The `attempts` array in `/health` still shows the one init record
+(plus the Tensor primer record when relevant) so you can see
+exactly what happened without re-parsing logs.
+
 ## Two caches
 
 **Engine LRU** (`LruCache<String, CachedEngine>`, capacity 2). Cache
@@ -145,9 +176,21 @@ key is `model_<maxTokens|"model">_<backend>`. Eviction closes the
 underlying `Engine` and removes every cached `Conversation` keyed off
 that engine (conversations can't outlive their parent).
 
-**Conversation LRU** (`LruCache<String, CachedSession>`, capacity 4).
-Cache key is `<session_id>_<engineKey>`. Eviction calls
-`Conversation.close()`.
+**Conversation LRU** (`LruCache<String, CachedSession>`, capacity 4)
+managed by `SessionManager`. Cache key is
+`<session_id>_<engineKey>`. Eviction calls `Conversation.close()`,
+and the engine LRU's `entryRemoved` listener cascades into the
+session manager so conversations never outlive their parent engine.
+
+Reuse requires **all** of:
+
+- prefix hash of `messages[0..seenCount]` matches the cached value
+- `temperature` and `topK` unchanged
+- exactly one new driving (user / tool) turn after `seenCount`
+
+Any mismatch drops the cache entry and rebuilds. Stateless requests
+(empty `session_id`) close their conversation immediately in
+`finally`.
 
 The engine cache is the expensive one — each loaded model takes
 ~2.5 GB of RAM and ~800 MB of XNNPACK kernel cache on disk after

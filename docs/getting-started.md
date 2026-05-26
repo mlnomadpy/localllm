@@ -44,6 +44,27 @@ On Android 13+ the app asks for `POST_NOTIFICATIONS` on first launch
 — grant it, otherwise the foreground service notification (and the
 **Stop** action on it) won't show.
 
+## The app's five tabs (plus Documents)
+
+Once installed, the app exposes six tabs:
+
+- **Catalog** — download a built-in model, import a `.litertlm` file
+  from your device, set the default, or delete to free space. The
+  AICore status card lives at the top.
+- **Dashboard** — live queue, in-flight request, per-client
+  summaries, history (cap 50), cumulative stats, and an AICore
+  benchmark button.
+- **Console** — searchable in-memory log buffer (200 entries) with
+  level filters, tag chips, and copy-on-long-press.
+- **Chat** — a usable test harness against the local server, with
+  streaming, a Stop button that actually cancels, a system-prompt
+  sheet, sample prompts, and long-press copy on every message.
+- **Documents** — RAG ingest, list, delete, and k-NN search against
+  the local ObjectBox HNSW store. Tenant-scoped by `X-Client-Id` or
+  `User-Agent`.
+- **Settings** — server, inference, security, background efficiency,
+  request limits, startup, and custom model URLs.
+
 ## Pick a model
 
 You have two paths:
@@ -84,7 +105,7 @@ client at it.
 === "curl, blocking"
 
     ```bash
-    curl http://localhost:8099/v1/chat/completions \
+    curl http://localhost:8080/v1/chat/completions \
       -H "Content-Type: application/json" \
       -d '{
         "model": "gemma-4-e2b",
@@ -95,7 +116,7 @@ client at it.
 === "curl, streaming SSE"
 
     ```bash
-    curl -N http://localhost:8099/v1/chat/completions \
+    curl -N http://localhost:8080/v1/chat/completions \
       -H "Content-Type: application/json" \
       -d '{
         "model": "gemma-4-e2b",
@@ -110,7 +131,7 @@ client at it.
     from openai import OpenAI
 
     client = OpenAI(
-        base_url="http://localhost:8099/v1",
+        base_url="http://localhost:8080/v1",
         api_key="not-needed"  # set Settings → API key on the device if you want auth
     )
 
@@ -127,7 +148,7 @@ client at it.
     Enable **Settings → Allow CORS** on the device first.
 
     ```js
-    const r = await fetch("http://192.168.4.49:8099/v1/chat/completions", {
+    const r = await fetch("http://192.168.4.49:8080/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -146,8 +167,8 @@ can reach it. Two ways to widen that:
 **`adb forward`** for a USB-connected dev machine:
 
 ```bash
-adb forward tcp:8099 tcp:8099
-# now http://localhost:8099 on your laptop hits the phone
+adb forward tcp:8080 tcp:8080
+# now http://localhost:8080 on your laptop hits the phone
 ```
 
 **LAN binding** if you want any device on the same Wi-Fi to use it:
@@ -166,7 +187,7 @@ adb forward tcp:8099 tcp:8099
 ## Verify it's actually working
 
 ```bash
-curl -s http://localhost:8099/health | jq
+curl -s http://localhost:8080/health | jq
 ```
 
 ```json
@@ -178,23 +199,24 @@ curl -s http://localhost:8099/health | jq
   "engines_loaded": 1,
   "engines": [
     {
-      "key": "gemma-4-e2b_model_AUTO",
-      "backend": "CPU",
+      "key": "gemma-4-e2b_model_LITERT_CPU",
+      "backend": "LITERT_CPU",
       "attempts": [
-        {"backend": "NPU", "result": "failed: TF_LITE_AUX not found in the model", "duration_ms": 5394},
-        {"backend": "GPU", "result": "skipped: known SIGSEGV on Tensor", "duration_ms": 0},
-        {"backend": "CPU", "result": "ok", "duration_ms": 3168}
+        {"backend": "NPU-primer", "result": "expected-fail: no vendor delegate", "duration_ms": 312},
+        {"backend": "LITERT_CPU", "result": "ok", "duration_ms": 3168}
       ]
     }
   ]
 }
 ```
 
-`engines[].backend` is the *real* backend that initialized.
-`engines[].attempts` is the full chain — NPU → GPU → CPU for AUTO —
-with the outcome and duration of each step. AICore requests don't
-appear here; they run inside the AICore system service and don't go
-through the LiteRT engine cache. To verify AICore, send a request to
-`gemini-nano-aicore` and watch the **Console** tab.
+`engines[].backend` is the catalog-declared backend that the engine
+initialized on. `engines[].attempts` records the single init attempt
+(plus the one-shot Tensor `NPU-primer` on Pixel 6/9/10) with outcome
+and duration. AICore requests don't appear in the engines list —
+they run inside the AICore system service and don't go through the
+LiteRT engine cache. To verify AICore, send a request to
+`gemini-nano-aicore`, watch the **Console** tab, or hit
+`GET /v1/aicore/status` for a detailed readiness probe.
 
 Next up: [the full HTTP API surface](api.md).
